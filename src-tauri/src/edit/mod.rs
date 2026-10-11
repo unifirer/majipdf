@@ -3,6 +3,7 @@
 //! Edits are data and the output is a pure function of (original bytes, effective edits); undo/redo only moves a cursor.
 mod build;
 mod content;
+mod docobj;
 mod fonts;
 mod layout;
 pub mod sig;
@@ -12,7 +13,7 @@ use crate::compress::{self, place, run_gs, size_of, stamp, temp_root, GsErr};
 use crate::job::JobGuard;
 use crate::pdf::{self, Opened};
 use base64::Engine;
-use content::{zones, Analysis};
+use content::{zones, Analysis, OK};
 use fonts::{deref, effective_resources, load_fonts, num, used_codes, Fnt};
 #[cfg(test)]
 use layout::{retype, typeset};
@@ -54,6 +55,7 @@ pub struct ParaOut {
     color: String,
     status: &'static str,
     reason: Option<&'static str>,
+    removed: bool, // taken out with the Select tool; bbox is empty
     edited: bool,
     pc_font_used: bool,
     rot: i64, // clockwise angle at which the text appears on the displayed page
@@ -93,12 +95,24 @@ pub struct ObjOut {
     runs: Option<Vec<Run>>,
 }
 
+/// Anything the Select tool can pick: a paragraph, an image or a path (Edit 3).
+#[derive(Serialize, Clone, Debug)]
+pub struct ItemOut {
+    id: u32,
+    kind: &'static str,
+    bbox: [f64; 4], // display pt, top-left origin
+    rot: i64,
+    locked: Option<&'static str>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct PageModel {
     page: u32,
     paras: Vec<ParaOut>,
     scan: bool,
     objs: Vec<ObjOut>,
+    items: Vec<ItemOut>,
+    wm_forced_front: bool, // a watermark "behind" is drawn in front on this page (scan)
 }
 
 #[derive(Deserialize)]
@@ -170,6 +184,101 @@ pub struct EditSaveRes {
     seconds: f64,
 }
 
+// ---------------- Edit 3 wire types ----------------
+
+/// What a Select-tool item is.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum IKind {
+    Para,
+    Image,
+    Path,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ItemRef {
+    kind: IKind,
+    id: u32,
+}
+
+/// One edit of the Select tool (display pt, y down).
+#[derive(Deserialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjEdit3 {
+    Move { page: u32, item: ItemRef, dx: f64, dy: f64 },
+    Resize { page: u32, item: ItemRef, rect: [f64; 4] },
+    Remove { page: u32, item: ItemRef },
+}
+
+#[derive(Deserialize, Debug)]
+pub struct EditBatchReq {
+    edits: Vec<ObjEdit3>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BatchRes {
+    Ok { pages: Vec<PageModel> },
+    CannotMove { page: u32, item: ItemRef },
+}
+
+fn d_margin() -> f64 {
+    28.0
+}
+fn d_start() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WmReq {
+    id: Option<u32>,
+    kind: String, // "text" | "image"
+    text: Option<String>,
+    style: Option<Fmt>,
+    asset: Option<String>,
+    scale: Option<f64>,
+    opacity: f64,
+    angle: f64,
+    layer: String, // "behind" | "front"
+    pages: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HfReq {
+    id: Option<u32>,
+    pos: String, // tl tc tr bl bc br
+    template: String,
+    style: Fmt,
+    #[serde(default = "d_margin")]
+    margin_pt: f64,
+    #[serde(default = "d_start")]
+    start: u32,
+    #[serde(default)]
+    skip_first: bool,
+    #[serde(default)]
+    pages: String,
+    #[serde(default)]
+    lang: String,
+    #[serde(default)]
+    tz_min: i32,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocRes {
+    Ok { id: u32, changed: &'static str },
+    BadPages { reason: String },
+    UnsupportedChars { chars: String },
+    TooLong,
+    BadText,
+}
+
+#[derive(Serialize, Debug)]
+pub struct DocObjs {
+    watermarks: Vec<WmReq>,
+    header_footers: Vec<HfReq>,
+}
+
 // ---------------- helpers on the lopdf side ----------------
 
 fn inherited<'a>(doc: &'a Document, page: ObjectId, key: &[u8]) -> Option<&'a Object> {
@@ -224,6 +333,19 @@ fn norm(s: &str) -> String {
 
 // ---------------- page analysis ----------------
 
+/// An image or path of a page for the Select tool. `op` = the painting op (or Do), `lo` = its first construction op.
+#[derive(Clone, Debug)]
+pub struct PItem {
+    kind: IKind,
+    id: u32,
+    op: usize, // usize::MAX: inside a form XObject (locked)
+    lo: usize,
+    bbox: [f64; 4], // analysis frame x0 y0 x1 y1
+    locked: Option<&'static str>,
+    name: Option<String>, // XObject name of a Do
+    clip: bool,           // the path also sets the clip (W)
+}
+
 pub struct PageAn {
     idx: u32,
     pid: ObjectId,
@@ -245,6 +367,7 @@ pub struct PageAn {
     q: i64, // extra turn of the work frame, degrees
     form_segs: Vec<Seg>,   // text inside form XObjects (work frame): can only be covered
     form_imgs: Vec<[f64; 4]>, // images inside form XObjects (work frame x0 y0 x1 y1)
+    items: Vec<PItem>,
 }
 
 pub struct Dom {
@@ -295,7 +418,7 @@ fn display_matrix(b: [f64; 4], rot: i64) -> content::M {
     content::mul(content::tr(-b[0], -b[1]), r)
 }
 
-fn walk(o: &PdfPageObject, form: bool, direct: &mut Vec<String>, forms: &mut Vec<Seg>, imgs: &mut Vec<[f64; 4]>) {
+fn walk(o: &PdfPageObject, form: bool, direct: &mut Vec<String>, forms: &mut Vec<Seg>, imgs: &mut Vec<[f64; 4]>, paths: &mut Vec<[f64; 4]>) {
     if let Some(t) = o.as_text_object() {
         if !form {
             direct.push(t.text());
@@ -318,15 +441,73 @@ fn walk(o: &PdfPageObject, form: bool, direct: &mut Vec<String>, forms: &mut Vec
             reason: Some("form"),
             fam: layout::family(&t.font().name()),
         });
-    } else if form && o.as_image_object().is_some() {
+    } else if form && (o.as_image_object().is_some() || o.as_path_object().is_some()) {
         if let Ok(q) = o.bounds().map(|q| q.to_rect()) {
-            imgs.push([q.left().value as f64, q.bottom().value as f64, q.right().value as f64, q.top().value as f64]);
+            let b = [q.left().value as f64, q.bottom().value as f64, q.right().value as f64, q.top().value as f64];
+            if o.as_image_object().is_some() { imgs.push(b) } else { paths.push(b) }
         }
     } else if let Some(x) = o.as_x_object_form_object() {
         for c in x.iter() {
-            walk(&c, true, direct, forms, imgs);
+            walk(&c, true, direct, forms, imgs, paths);
         }
     }
+}
+
+fn xobj_is_image(doc: &Document, page: ObjectId, name: &str) -> bool {
+    let Some(xo) = effective_resources(doc, page).and_then(|r| r.get(b"XObject").ok()).and_then(|o| deref(doc, o).as_dict().ok()) else { return false };
+    matches!(xo.get(name.as_bytes()).ok().map(|o| deref(doc, o)), Some(Object::Stream(s)) if s.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) == Some(b"Image"))
+}
+
+/// Images and paths of a page in op order (ids are per kind and stable: they only depend on the original content),
+/// then the ones inside form XObjects, which are locked.
+fn page_items(doc: &Document, pid: ObjectId, joined: &[u8], an: &Analysis, form_imgs: &[[f64; 4]], form_paths: &[[f64; 4]], lock_all: Option<&'static str>) -> Vec<PItem> {
+    let (mut ni, mut np) = (0u32, 0u32);
+    let mut out: Vec<PItem> = vec![];
+    for (i, o) in an.ops.iter().enumerate() {
+        let name = content::op_name(joined, o);
+        let (kind, nm) = match o.k {
+            OK::Do => match o.bbox.and(do_name(joined, o)) {
+                Some(n) if xobj_is_image(doc, pid, &n) => (IKind::Image, Some(n)),
+                _ => continue,
+            },
+            OK::Paint if name == "BI" => (IKind::Image, None),
+            OK::Paint if name != "sh" && o.bbox.is_some() => (IKind::Path, None),
+            _ => continue,
+        };
+        let mut b = o.bbox.unwrap();
+        let mut lo = i;
+        let mut clip = false;
+        if kind == IKind::Path {
+            // construction ops since the last paint or n (a W among them makes the path a clip too)
+            while lo > 0 && matches!(content::op_name(joined, &an.ops[lo - 1]), "m" | "l" | "c" | "v" | "y" | "h" | "re" | "W" | "W*") {
+                lo -= 1;
+                clip |= matches!(content::op_name(joined, &an.ops[lo]), "W" | "W*");
+            }
+            // a hairline still needs a target to hit
+            for (a, z) in [(0, 2), (1, 3)] {
+                if b[z] - b[a] < 1.0 {
+                    let m = (b[a] + b[z]) / 2.0;
+                    (b[a], b[z]) = (m - 0.5, m + 0.5);
+                }
+            }
+        }
+        let id = if kind == IKind::Image { ni += 1; ni - 1 } else { np += 1; np - 1 };
+        out.push(PItem { kind, id, op: i, lo, bbox: b, locked: lock_all, name: nm, clip });
+    }
+    for b in form_imgs {
+        out.push(PItem { kind: IKind::Image, id: ni, op: usize::MAX, lo: usize::MAX, bbox: *b, locked: Some("form"), name: None, clip: false });
+        ni += 1;
+    }
+    for b in form_paths {
+        out.push(PItem { kind: IKind::Path, id: np, op: usize::MAX, lo: usize::MAX, bbox: *b, locked: Some("form"), name: None, clip: false });
+        np += 1;
+    }
+    out
+}
+
+fn do_name(joined: &[u8], o: &content::Op) -> Option<String> {
+    let t = String::from_utf8_lossy(&joined[o.s..o.e]).to_string();
+    Some(t.trim().strip_prefix('/')?.split_whitespace().next()?.to_string())
 }
 
 fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String> {
@@ -352,15 +533,15 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
         an = content::analyse_with(&joined, &fonts, &|n| xobj_box(doc, pid, n), rmat);
     }
     // pdfium side: text objects for the 1:1 check and undecodable codes, form text, image coverage
-    let (direct, forms, form_imgs, coverage) = {
+    let (direct, forms, form_imgs, form_paths, coverage) = {
         let p = pdf::pdfium()?;
         let d = p.load_pdf_from_byte_vec(orig.to_vec(), None).map_err(|e| e.to_string())?;
         let pg = d.pages().get(idx as PdfPageIndex).map_err(|e| e.to_string())?;
-        let (mut direct, mut forms, mut imgs) = (vec![], vec![], vec![]);
+        let (mut direct, mut forms, mut imgs, mut paths) = (vec![], vec![], vec![], vec![]);
         for o in pg.objects().iter() {
-            walk(&o, false, &mut direct, &mut forms, &mut imgs);
+            walk(&o, false, &mut direct, &mut forms, &mut imgs, &mut paths);
         }
-        (direct, forms, imgs, pdf::image_coverage(&pg))
+        (direct, forms, imgs, paths, pdf::image_coverage(&pg))
     };
     // form text comes from pdfium in user space: into the display frame
     let forms: Vec<Seg> = forms
@@ -374,13 +555,12 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
             s
         })
         .collect();
-    let form_imgs: Vec<[f64; 4]> = form_imgs
-        .into_iter()
-        .map(|b| {
-            let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| (x * rmat[0] + y * rmat[2] + rmat[4], x * rmat[1] + y * rmat[3] + rmat[5]));
-            [pts.iter().map(|p| p.0).fold(f64::MAX, f64::min), pts.iter().map(|p| p.1).fold(f64::MAX, f64::min), pts.iter().map(|p| p.0).fold(f64::MIN, f64::max), pts.iter().map(|p| p.1).fold(f64::MIN, f64::max)]
-        })
-        .collect();
+    let to_work = |b: [f64; 4]| -> [f64; 4] {
+        let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| (x * rmat[0] + y * rmat[2] + rmat[4], x * rmat[1] + y * rmat[3] + rmat[5]));
+        [pts.iter().map(|p| p.0).fold(f64::MAX, f64::min), pts.iter().map(|p| p.1).fold(f64::MAX, f64::min), pts.iter().map(|p| p.0).fold(f64::MIN, f64::max), pts.iter().map(|p| p.1).fold(f64::MIN, f64::max)]
+    };
+    let form_imgs: Vec<[f64; 4]> = form_imgs.into_iter().map(to_work).collect();
+    let form_paths: Vec<[f64; 4]> = form_paths.into_iter().map(to_work).collect();
     let form_segs = forms.clone();
     let lock_all = if rot % 90 != 0 {
         Some("rotated")
@@ -410,7 +590,8 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
         }
     }
     let (foot_y, head_y) = zones(&an, page, pitch);
-    Ok(PageAn { idx, form_segs, form_imgs, pid, page, lock: lock_all, pdfium_texts: direct.len(), scan: coverage >= pdf::IMAGE_DOMINANT_PCT, joined, an, fonts, paras, foot_y, head_y, rinv: content::inv(rmat).unwrap_or(content::ID), disp, to_disp, q })
+    let items = page_items(doc, pid, &joined, &an, &form_imgs, &form_paths, lock_all);
+    Ok(PageAn { idx, items, form_segs, form_imgs, pid, page, lock: lock_all, pdfium_texts: direct.len(), scan: coverage >= pdf::IMAGE_DOMINANT_PCT, joined, an, fonts, paras, foot_y, head_y, rinv: content::inv(rmat).unwrap_or(content::ID), disp, to_disp, q })
 }
 
 // ---------------- edits and building ----------------
@@ -450,11 +631,66 @@ struct ObjE {
     use_pc: bool,
 }
 
+/// Select-tool state of one paragraph, image or path: moved (dx, dy in display pt, y down; images keep the new box instead) or removed.
+/// An image's `rect` is where it sits before any push (pushes by paragraph edits still apply on top).
+#[derive(Clone, Debug, PartialEq)]
+struct MvE {
+    page: u32,
+    kind: IKind,
+    id: u32,
+    dx: f64,
+    dy: f64,
+    rect: Option<[f64; 4]>,
+    removed: bool,
+}
+
+impl MvE {
+    fn new(page: u32, kind: IKind, id: u32) -> MvE {
+        MvE { page, kind, id, dx: 0.0, dy: 0.0, rect: None, removed: false }
+    }
+    fn is_identity(&self) -> bool {
+        self.dx.abs() < 1e-9 && self.dy.abs() < 1e-9 && self.rect.is_none() && !self.removed
+    }
+}
+
+/// Watermark over the whole document (or its page ranges).
+#[derive(Clone, Debug, PartialEq)]
+struct WmE {
+    id: u32,
+    image: bool,
+    text: String,
+    style: Fmt,
+    asset: String,
+    scale: f64,
+    opacity: f64,
+    angle: f64,
+    front: bool,
+    pages: String,
+}
+
+/// Header or footer text with placeholders.
+#[derive(Clone, Debug, PartialEq)]
+struct HfE {
+    id: u32,
+    pos: String,
+    template: String,
+    style: Fmt,
+    margin_pt: f64,
+    start: u32,
+    skip_first: bool,
+    pages: String,
+    lang: String,
+    tz_min: i32,
+}
+
 /// One entry of the effective edit list; list order is z-order.
 #[derive(Clone, Debug, PartialEq)]
 enum Item {
     Para(Edit),
     Obj(ObjE),
+    Mv(MvE),
+    Wm(WmE),
+    Hf(HfE),
 }
 
 impl From<Edit> for Item {
@@ -464,10 +700,13 @@ impl From<Edit> for Item {
 }
 
 impl Item {
+    /// u32::MAX for the document-wide items (watermark, header/footer).
     fn page(&self) -> u32 {
         match self {
             Item::Para(e) => e.page,
             Item::Obj(o) => o.page,
+            Item::Mv(m) => m.page,
+            Item::Wm(_) | Item::Hf(_) => u32::MAX,
         }
     }
 }
@@ -476,7 +715,8 @@ impl Item {
 #[derive(Clone, Debug)]
 enum Act {
     Set(Item),
-    Del(u32, u32), // page, id
+    Del(u32, u32), // page (u32::MAX = document-wide), id
+    Batch(Vec<Act>), // one undo step
 }
 
 #[derive(Debug)]
@@ -486,6 +726,9 @@ enum BErr {
     Overflow(u32),
     CannotPush,
     Partial(usize),
+    CannotMove(u32, IKind, u32), // page, item
+    BadPages(String),
+    TooLong,
     Other(String),
 }
 
@@ -504,6 +747,9 @@ struct PageInfo {
     objs: HashMap<u32, [f64; 4]>,  // text box -> display rect with its real typeset size
     removed: usize,            // glyphs removed by white-outs
     runs: HashMap<u32, Vec<Run>>, // edited paragraph -> its content as runs
+    off: HashMap<u32, (f64, f64)>, // moved paragraph -> offset (analysis frame)
+    gone: HashSet<u32>,        // removed paragraphs
+    ishift: HashMap<(IKind, u32), f64>, // image / path -> how far a push moved it down, pt
 }
 
 struct Built {
@@ -536,6 +782,7 @@ struct Session {
     built: Option<Arc<Built>>,
     used: Option<Arc<HashMap<ObjectId, HashSet<u32>>>>,
     floor_override: Option<f64>, // tests only
+    scan_cache: HashMap<u32, bool>,
     _guard: Option<JobGuard>,
 }
 
@@ -582,7 +829,7 @@ impl Session {
             v
         };
         let edoc = EditDoc { pages: sizes.len() as u32, sizes: sizes.clone() };
-        let s = Session { orig, doc, path: path.to_path_buf(), sizes, pages: HashMap::new(), hist: vec![], cursor: 0, assets: HashMap::new(), next_id: 0, lib_dir: None, built: None, used: None, floor_override: None, _guard: guard };
+        let s = Session { orig, doc, path: path.to_path_buf(), sizes, pages: HashMap::new(), hist: vec![], cursor: 0, assets: HashMap::new(), next_id: 0, lib_dir: None, built: None, used: None, floor_override: None, scan_cache: HashMap::new(), _guard: guard };
         Ok((s, edoc))
     }
 
@@ -602,29 +849,31 @@ impl Session {
     fn effective(&mut self) -> Vec<Item> {
         let mut v: Vec<Item> = vec![];
         for a in &self.hist[..self.cursor] {
-            match a {
-                Act::Set(it) => {
-                    let same = |x: &Item| match (x, it) {
-                        (Item::Para(p), Item::Para(q)) => p.page == q.page && p.para == q.para,
-                        (Item::Obj(p), Item::Obj(q)) => p.id == q.id,
-                        _ => false,
-                    };
-                    match v.iter().position(same) {
-                        Some(i) => v[i] = it.clone(),
-                        None => v.push(it.clone()),
-                    }
-                }
-                Act::Del(_, id) => v.retain(|x| !matches!(x, Item::Obj(o) if o.id == *id)),
-            }
+            replay(&mut v, a);
         }
         let keep: Vec<bool> = v
             .iter()
             .map(|it| match it {
                 Item::Para(e) => e.use_pc || e.style.is_some() || e.runs.is_some() || self.page(e.page).ok().and_then(|p| p.paras.get(e.para as usize).map(|q| norm(&q.text) != e.text)).unwrap_or(true),
+                Item::Mv(m) => !m.is_identity(),
                 _ => true,
             })
             .collect();
         v.into_iter().zip(keep).filter(|x| x.1).map(|x| x.0).collect()
+    }
+
+    /// Scan flags (image-dominant pages) of the original, cached.
+    fn scan_flags(&mut self, pages: &BTreeSet<u32>) -> Result<HashMap<u32, bool>, String> {
+        let todo: Vec<u32> = pages.iter().copied().filter(|p| !self.scan_cache.contains_key(p)).collect();
+        if !todo.is_empty() {
+            let p = pdf::pdfium()?;
+            let d = p.load_pdf_from_byte_vec(self.orig.clone(), None).map_err(|e| e.to_string())?;
+            for pg in todo {
+                let page = d.pages().get(pg as PdfPageIndex).map_err(|e| e.to_string())?;
+                self.scan_cache.insert(pg, pdf::image_coverage(&page) >= pdf::IMAGE_DOMINANT_PCT);
+            }
+        }
+        Ok(pages.iter().map(|p| (*p, self.scan_cache[p])).collect())
     }
 
     fn build<T: Into<Item> + Clone>(&mut self, edits: &[T]) -> Result<Built, BErr> {
@@ -636,16 +885,58 @@ impl Session {
             self.used = Some(Arc::new(used_codes(&self.doc)));
         }
         let used = self.used.clone().unwrap();
+        let n = self.sizes.len() as u32;
+        // document-wide objects: which pages, numbering, default styles
+        let stem = self.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let (mut wms, mut hfs): (Vec<docobj::WmPlan>, Vec<docobj::HfPlan>) = (vec![], vec![]);
+        for it in &items {
+            match it {
+                Item::Wm(w) => wms.push(docobj::WmPlan { w: w.clone(), pages: docobj::parse_pages(&w.pages, n).map_err(BErr::BadPages)? }),
+                Item::Hf(h) => {
+                    let pages: Vec<u32> = docobj::parse_pages(&h.pages, n).map_err(BErr::BadPages)?.into_iter().collect();
+                    let Some(&first) = pages.first() else { continue };
+                    let mut style = h.style.clone();
+                    if style.size <= 0.0 || style.font.is_empty() || style.font == "orig" {
+                        // the dominant body style of the first page in its PC family, 2 pt smaller (at least 8)
+                        let dom = self.page(first)?.dominant();
+                        let fams = fonts::available_families();
+                        if style.font.is_empty() || style.font == "orig" {
+                            style.font = dom.as_ref().map(|d| d.css.clone()).filter(|c| fams.contains(c)).unwrap_or_else(|| "Arial".into());
+                        }
+                        if style.size <= 0.0 {
+                            style.size = dom.as_ref().map(|d| (d.size - 2.0).max(8.0)).unwrap_or(10.0);
+                        }
+                    }
+                    let total = pages.len() as i64 + h.start as i64 - 1;
+                    hfs.push(docobj::HfPlan { h: h.clone(), pages, style, total, date: docobj::today(&h.lang, h.tz_min), date_id: docobj::today("id", h.tz_min), date_en: docobj::today("en", h.tz_min), file: stem.clone() });
+                }
+                _ => {}
+            }
+        }
+        let need: BTreeSet<u32> = wms.iter().filter(|w| !w.w.front).flat_map(|w| w.pages.iter().copied()).collect();
+        let scans = if need.is_empty() { HashMap::new() } else { self.scan_flags(&need)? };
+        let mut pages: BTreeSet<u32> = items.iter().map(Item::page).filter(|p| *p != u32::MAX).collect();
+        pages.extend(wms.iter().flat_map(|w| w.pages.iter().copied()));
+        pages.extend(hfs.iter().flat_map(|h| h.pages.iter().copied()));
         let mut doc = self.doc.clone();
+        let pids = doc.get_pages();
         let mut acc = build::Acc::default();
         let mut info = HashMap::new();
-        let pages: BTreeSet<u32> = items.iter().map(Item::page).collect();
         let assets = self.assets.clone();
         for pg in pages {
-            let pa = self.page(pg)?;
+            let pid = *pids.get(&(pg + 1)).ok_or_else(|| BErr::Other("bad page".into()))?;
             let es: Vec<&Item> = items.iter().filter(|e| e.page() == pg).collect();
+            let pa = if es.is_empty() { None } else { Some(self.page(pg)?) };
             let sh = build::Shared { used: &used, floor_override: self.floor_override, orig: &self.orig, assets: &assets };
-            info.insert(pg, build::build_page(&mut doc, &pa, &es, &sh, &mut acc)?);
+            let g = docobj::geom(&doc, pid);
+            let add = docobj::page_add(&mut doc, &mut acc, &sh, &g, pg, &wms, &hfs, &scans)?;
+            match pa {
+                Some(pa) => {
+                    info.insert(pg, build::build_page(&mut doc, &pa, &es, &sh, &mut acc, &add)?);
+                }
+                None if !add.behind.is_empty() || !add.front.is_empty() => build::light_page(&mut doc, pid, &add, &mut acc),
+                None => {}
+            }
         }
         let live: HashSet<ObjectId> = doc.page_iter().flat_map(|p| doc.get_page_contents(p)).collect();
         for id in acc.old.into_iter().filter(|i| !live.contains(i)) {
@@ -676,7 +967,7 @@ impl Session {
         let b = self.built()?;
         let items = self.effective();
         let info = b.info.get(&idx);
-        let paras = pa
+        let paras: Vec<ParaOut> = pa
             .paras
             .iter()
             .map(|p| {
@@ -687,18 +978,21 @@ impl Session {
                 let shift = info.and_then(|i| i.shift.get(p.id as usize)).copied().unwrap_or(0.0);
                 let nl = info.and_then(|i| i.lines.get(&p.id)).copied().unwrap_or(p.nlines);
                 let pitch = e.and_then(|e| e.style.as_ref()).filter(|st| st.size > 0.0 && p.size > 0.0).map(|st| p.pitch * st.size / p.size).unwrap_or(p.pitch);
-                let (top, bot) = (p.top - shift, p.bot - shift - (nl as f64 * pitch - p.nlines as f64 * p.pitch));
+                let gone = info.is_some_and(|i| i.gone.contains(&p.id));
+                let (ox, oy) = info.and_then(|i| i.off.get(&p.id)).copied().unwrap_or((0.0, 0.0));
+                let (top, bot) = (p.top - shift + oy, p.bot - shift + oy - (nl as f64 * pitch - p.nlines as f64 * p.pitch));
                 let base = Fmt { font: build::base_font(p), size: p.size, color: p.color.clone(), bold: p.bold, italic: p.italic, align: p.align };
                 ParaOut {
                     id: p.id,
                     bbox: {
                         let (l, r) = info.and_then(|i| i.ext.get(&p.id)).copied().unwrap_or((p.l, p.r));
+                        let (l, r) = (l + ox, r + ox);
                         // work frame -> displayed page, top-left origin
                         let t = pa.to_disp;
                         let pts = [(l, bot), (r, bot), (r, top.max(bot)), (l, top.max(bot))].map(|(x, y)| (x * t[0] + y * t[2] + t[4], x * t[1] + y * t[3] + t[5]));
                         let (x0, x1) = (pts.iter().map(|p| p.0).fold(f64::MAX, f64::min), pts.iter().map(|p| p.0).fold(f64::MIN, f64::max));
                         let (y0, y1) = (pts.iter().map(|p| p.1).fold(f64::MAX, f64::min), pts.iter().map(|p| p.1).fold(f64::MIN, f64::max));
-                        [x0, pa.disp[1] - y1, x1 - x0, y1 - y0]
+                        if gone { [0.0; 4] } else { [x0, pa.disp[1] - y1, x1 - x0, y1 - y0] }
                     },
                     text: e.map(|e| e.text.clone()).unwrap_or_else(|| p.text.clone()),
                     marker: p.marker.clone(),
@@ -710,8 +1004,9 @@ impl Session {
                     bold: p.bold,
                     italic: p.italic,
                     color: p.color.clone(),
-                    status: if p.locked.is_some() { "locked" } else if p.pc_font { "pc_font" } else { "direct" },
-                    reason: p.locked,
+                    status: if p.locked.is_some() || gone { "locked" } else if p.pc_font { "pc_font" } else { "direct" },
+                    reason: if gone { Some("removed") } else { p.locked },
+                    removed: gone,
                     edited: e.is_some(),
                     pc_font_used: info.is_some_and(|i| i.pc.contains(&p.id)),
                     rot: (360 - pa.q) % 360,
@@ -746,11 +1041,47 @@ impl Session {
                 _ => None,
             })
             .collect();
-        Ok(PageModel { page: idx, paras, scan: pa.scan, objs })
+        // Select-tool items: paragraphs as modelled above, then images and paths where the current state puts them
+        // z-order: by the position of the item's first op in the content stream (last = on top); form content and locked text sit at the bottom
+        let mut sel: Vec<(usize, ItemOut)> = paras
+            .iter()
+            .zip(pa.paras.iter())
+            .filter(|(p, _)| !p.removed)
+            .map(|(p, q)| {
+                let z = q.ed.as_ref().and_then(|e| e.shows.iter().map(|&i| pa.an.shows[i].op).min()).unwrap_or(0);
+                (z, ItemOut { id: p.id, kind: "para", bbox: p.bbox, rot: p.rot, locked: if p.status == "locked" { p.reason } else { None } })
+            })
+            .collect();
+        for pi in &pa.items {
+            let mv = items.iter().find_map(|x| match x {
+                Item::Mv(m) if m.page == idx && m.kind == pi.kind && m.id == pi.id => Some(m),
+                _ => None,
+            });
+            if mv.is_some_and(|m| m.removed) {
+                continue;
+            }
+            let tot = info.and_then(|i| i.ishift.get(&(pi.kind, pi.id))).copied().unwrap_or(0.0);
+            let wb = mv.and_then(|m| m.rect).map(|r| build::rect_work(&pa, r)).unwrap_or(pi.bbox);
+            let mut wb = [wb[0], wb[1] - tot, wb[2], wb[3] - tot];
+            if let Some(m) = mv.filter(|m| m.rect.is_none()) {
+                let (dx, dy) = disp_delta_to_work(&pa, m.dx, m.dy);
+                wb = [wb[0] + dx, wb[1] + dy, wb[2] + dx, wb[3] + dy];
+            }
+            sel.push((if pi.op == usize::MAX { 0 } else { pi.op }, ItemOut { id: pi.id, kind: if pi.kind == IKind::Image { "image" } else { "path" }, bbox: disp_of_work(&pa, wb), rot: 0, locked: pi.locked }));
+        }
+        sel.sort_by_key(|x| x.0);
+        let sel: Vec<ItemOut> = sel.into_iter().map(|x| x.1).collect();
+        let n = self.sizes.len() as u32;
+        let forced = pa.scan && items.iter().any(|x| matches!(x, Item::Wm(w) if !w.front && docobj::parse_pages(&w.pages, n).is_ok_and(|s| s.contains(&idx))));
+        Ok(PageModel { page: idx, paras, scan: pa.scan, objs, items: sel, wm_forced_front: forced })
     }
 
     fn history(&mut self, touched: Vec<u32>) -> EditHistory {
         let mut pages: Vec<u32> = self.effective().iter().map(Item::page).chain(touched).collect();
+        if pages.contains(&u32::MAX) {
+            // a document-wide object changes every page
+            pages = (0..self.sizes.len() as u32).collect();
+        }
         pages.sort_unstable();
         pages.dedup();
         EditHistory { can_undo: self.cursor > 0, can_redo: self.cursor < self.hist.len(), count: self.effective().len() as u32, changed_pages: pages }
@@ -763,6 +1094,8 @@ impl Session {
         let merge = self.cursor > 0
             && match (&self.hist[self.cursor - 1], &a) {
                 (Act::Set(Item::Para(p)), Act::Set(Item::Para(q))) => p.page == q.page && p.para == q.para && p.text == q.text,
+                (Act::Set(Item::Wm(p)), Act::Set(Item::Wm(q))) => p.id == q.id,
+                (Act::Set(Item::Hf(p)), Act::Set(Item::Hf(q))) => p.id == q.id,
                 (Act::Set(Item::Obj(p)), Act::Set(Item::Obj(q))) => p.id == q.id && p.kind == q.kind && p.text == q.text && p.rect == q.rect && p.rot == q.rot && p.asset == q.asset,
                 _ => false,
             };
@@ -815,7 +1148,7 @@ impl Session {
             Err(BErr::Unsupported(chars)) => Ok(EditApplyRes::UnsupportedChars { chars }),
             Err(BErr::Overflow(n)) => Ok(EditApplyRes::Overflow { lines_over: n }),
             Err(BErr::CannotPush) => Ok(EditApplyRes::CannotPush),
-            Err(BErr::Partial(_)) => Err("unexpected white-out result".into()),
+            Err(BErr::Partial(_)) | Err(BErr::CannotMove(..)) | Err(BErr::BadPages(_)) | Err(BErr::TooLong) => Err("unexpected result".into()),
             Err(BErr::Other(s)) => Err(s),
         }
     }
@@ -910,18 +1243,225 @@ impl Session {
         }
     }
 
+    // ---------------- Edit 3: Select tool, watermark, header & footer ----------------
+
+    /// Display-frame shift (pt, y down) that pushes from paragraph edits currently apply to an image or path.
+    fn push_shift(&mut self, page: u32, kind: IKind, id: u32) -> Result<(f64, f64), String> {
+        let tot = self.built()?.info.get(&page).and_then(|i| i.ishift.get(&(kind, id))).copied().unwrap_or(0.0);
+        let t = self.page(page)?.to_disp;
+        Ok((-tot * t[2], tot * t[3]))
+    }
+
+    /// Moves, resizes and removals of existing paragraphs, images and paths: one undo step for the whole list.
+    fn apply_batch(&mut self, req: &EditBatchReq) -> Result<BatchRes, String> {
+        let mut cur = self.effective();
+        let mut acts: Vec<Act> = vec![];
+        let mut pages: BTreeSet<u32> = BTreeSet::new();
+        for e in &req.edits {
+            let (page, item) = match e {
+                ObjEdit3::Move { page, item, .. } | ObjEdit3::Resize { page, item, .. } | ObjEdit3::Remove { page, item } => (*page, *item),
+            };
+            let pa = self.page(page)?;
+            let (exists, locked, orig) = match item.kind {
+                IKind::Para => match pa.paras.get(item.id as usize) {
+                    Some(p) => (true, p.locked.is_some() || p.ed.is_none(), [0.0; 4]),
+                    None => (false, false, [0.0; 4]),
+                },
+                k => match pa.items.iter().find(|x| x.kind == k && x.id == item.id) {
+                    Some(x) => (true, x.locked.is_some(), x.bbox),
+                    None => (false, false, [0.0; 4]),
+                },
+            };
+            if !exists {
+                return Err("no such item".into());
+            }
+            if locked {
+                return Ok(BatchRes::CannotMove { page, item });
+            }
+            let same = |x: &Item| matches!(x, Item::Mv(m) if m.page == page && m.kind == item.kind && m.id == item.id);
+            let mut mv = cur.iter().find(|x| same(x)).and_then(|x| if let Item::Mv(m) = x { Some(m.clone()) } else { None }).unwrap_or_else(|| MvE::new(page, item.kind, item.id));
+            match e {
+                ObjEdit3::Move { dx, dy, .. } if item.kind == IKind::Image => {
+                    let b = mv.rect.unwrap_or_else(|| disp_of_work(&pa, orig));
+                    mv.rect = Some([b[0] + dx, b[1] + dy, b[2], b[3]]);
+                }
+                ObjEdit3::Move { dx, dy, .. } => {
+                    mv.dx += dx;
+                    mv.dy += dy;
+                }
+                ObjEdit3::Resize { rect, .. } => {
+                    if item.kind != IKind::Image {
+                        return Err("only images can be resized".into());
+                    }
+                    let (sx, sy) = self.push_shift(page, item.kind, item.id)?;
+                    mv.rect = Some([rect[0] - sx, rect[1] - sy, rect[2].max(1.0), rect[3].max(1.0)]);
+                }
+                ObjEdit3::Remove { .. } => mv.removed = true,
+            }
+            match cur.iter().position(same) {
+                Some(i) => cur[i] = Item::Mv(mv.clone()),
+                None => cur.push(Item::Mv(mv.clone())),
+            }
+            acts.push(Act::Set(Item::Mv(mv)));
+            pages.insert(page);
+        }
+        if acts.is_empty() {
+            return Ok(BatchRes::Ok { pages: vec![] });
+        }
+        match self.build(&cur) {
+            Ok(b) => {
+                self.push_act(Act::Batch(acts));
+                self.built = Some(Arc::new(b));
+                let pages = pages.into_iter().map(|p| self.model(p)).collect::<Result<Vec<_>, _>>()?;
+                Ok(BatchRes::Ok { pages })
+            }
+            Err(BErr::CannotMove(page, kind, id)) => Ok(BatchRes::CannotMove { page, item: ItemRef { kind, id } }),
+            Err(BErr::Other(s)) => Err(s),
+            Err(_) => Err("cannot apply the change".into()),
+        }
+    }
+
+    /// PNG bytes of a library asset, kept in the session so placed uses survive deleting the library item.
+    fn ensure_asset(&mut self, asset: &str) -> Result<(), String> {
+        if !self.assets.contains_key(asset) {
+            let lib = sig::Lib { dir: match &self.lib_dir { Some(d) => d.clone(), None => sig::default_dir()? } };
+            let png = lib.png(asset).ok_or("no such asset")?;
+            self.assets.insert(asset.to_string(), Arc::new(png));
+        }
+        Ok(())
+    }
+
+    fn doc_id(&mut self, id: Option<u32>) -> u32 {
+        match id {
+            Some(id) => {
+                self.next_id = self.next_id.max(id);
+                id
+            }
+            None => {
+                self.next_id += 1;
+                self.next_id
+            }
+        }
+    }
+
+    /// Sets a watermark or header/footer (replacing the one with the same id) after a trial build.
+    fn apply_doc(&mut self, it: Item, id: u32) -> Result<DocRes, String> {
+        let mut trial = self.effective();
+        let same = |x: &Item| match (x, &it) {
+            (Item::Wm(a), Item::Wm(b)) => a.id == b.id,
+            (Item::Hf(a), Item::Hf(b)) => a.id == b.id,
+            _ => false,
+        };
+        match trial.iter().position(same) {
+            Some(i) => trial[i] = it.clone(),
+            None => trial.push(it.clone()),
+        }
+        match self.build(&trial) {
+            Ok(b) => {
+                self.push_act(Act::Set(it));
+                self.built = Some(Arc::new(b));
+                Ok(DocRes::Ok { id, changed: "all" })
+            }
+            Err(BErr::BadPages(reason)) => Ok(DocRes::BadPages { reason }),
+            Err(BErr::TooLong) => Ok(DocRes::TooLong),
+            Err(BErr::Unsupported(chars)) | Err(BErr::Missing(chars)) => Ok(DocRes::UnsupportedChars { chars }),
+            Err(BErr::Other(s)) => Err(s),
+            Err(_) => Err("cannot apply the change".into()),
+        }
+    }
+
+    fn apply_wm(&mut self, req: &WmReq) -> Result<DocRes, String> {
+        let image = match req.kind.as_str() {
+            "text" => false,
+            "image" => true,
+            _ => return Err("bad kind".into()),
+        };
+        if !image && req.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
+            return Ok(DocRes::BadText);
+        }
+        let asset = req.asset.clone().unwrap_or_default();
+        if image {
+            self.ensure_asset(&asset)?;
+        }
+        let style = req.style.clone().unwrap_or(Fmt { font: "Arial".into(), size: 0.0, color: "#808080".into(), bold: false, italic: false, align: Align::Center });
+        let id = self.doc_id(req.id);
+        let w = WmE {
+            id,
+            image,
+            text: req.text.clone().unwrap_or_default(),
+            style,
+            asset,
+            scale: req.scale.unwrap_or(50.0).clamp(10.0, 100.0),
+            opacity: req.opacity.clamp(0.05, 1.0),
+            angle: req.angle.clamp(-90.0, 90.0),
+            front: req.layer == "front",
+            pages: req.pages.trim().to_string(),
+        };
+        self.apply_doc(Item::Wm(w), id)
+    }
+
+    fn apply_hf(&mut self, req: &HfReq) -> Result<DocRes, String> {
+        if !["tl", "tc", "tr", "bl", "bc", "br"].contains(&req.pos.as_str()) {
+            return Err("bad position".into());
+        }
+        let id = self.doc_id(req.id);
+        let h = HfE {
+            id,
+            pos: req.pos.clone(),
+            template: req.template.clone(),
+            style: Fmt { color: if req.style.color.is_empty() { "#000000".into() } else { req.style.color.clone() }, ..req.style.clone() },
+            margin_pt: req.margin_pt.clamp(0.0, 300.0),
+            start: req.start,
+            skip_first: req.skip_first,
+            pages: req.pages.trim().to_string(),
+            lang: req.lang.clone(),
+            tz_min: req.tz_min,
+        };
+        self.apply_doc(Item::Hf(h), id)
+    }
+
+    fn doc_objs(&mut self) -> DocObjs {
+        let (mut watermarks, mut header_footers) = (vec![], vec![]);
+        for it in self.effective() {
+            match it {
+                Item::Wm(w) => watermarks.push(WmReq {
+                    id: Some(w.id),
+                    kind: if w.image { "image" } else { "text" }.into(),
+                    text: (!w.image).then(|| w.text.clone()),
+                    style: Some(w.style.clone()),
+                    asset: w.image.then(|| w.asset.clone()),
+                    scale: w.image.then_some(w.scale),
+                    opacity: w.opacity,
+                    angle: w.angle,
+                    layer: if w.front { "front" } else { "behind" }.into(),
+                    pages: w.pages.clone(),
+                }),
+                Item::Hf(h) => header_footers.push(HfReq { id: Some(h.id), pos: h.pos, template: h.template, style: h.style, margin_pt: h.margin_pt, start: h.start, skip_first: h.skip_first, pages: h.pages, lang: h.lang, tz_min: h.tz_min }),
+                _ => {}
+            }
+        }
+        DocObjs { watermarks, header_footers }
+    }
+
+    fn del_doc(&mut self, id: u32) -> Result<(), String> {
+        if !self.effective().iter().any(|x| matches!(x, Item::Wm(w) if w.id == id) || matches!(x, Item::Hf(h) if h.id == id)) {
+            return Err("no such object".into());
+        }
+        self.push_act(Act::Del(u32::MAX, id));
+        self.built = None;
+        self.built()?;
+        Ok(())
+    }
+
     fn step(&mut self, back: bool) -> Result<EditHistory, String> {
         let touched: Vec<u32> = self.effective().iter().map(Item::page).collect();
         let at = if back { self.cursor.checked_sub(1) } else { (self.cursor < self.hist.len()).then_some(self.cursor) };
         let Some(at) = at else { return Ok(self.history(vec![])) };
-        let page = match &self.hist[at] {
-            Act::Set(it) => it.page(),
-            Act::Del(p, _) => *p,
-        };
+        let pages = act_pages(&self.hist[at]);
         self.cursor = if back { at } else { at + 1 };
         self.built = None;
         self.built()?;
-        Ok(self.history(touched.into_iter().chain([page]).collect()))
+        Ok(self.history(touched.into_iter().chain(pages).collect()))
     }
 
     fn render(&mut self, page: u32, width_px: u32) -> Result<String, String> {
@@ -931,6 +1471,56 @@ impl Session {
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85).encode_image(&image::DynamicImage::ImageRgba8(img).to_rgb8()).map_err(|e| e.to_string())?;
         Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(buf)))
     }
+}
+
+fn act_pages(a: &Act) -> Vec<u32> {
+    match a {
+        Act::Set(it) => vec![it.page()],
+        Act::Del(p, _) => vec![*p],
+        Act::Batch(v) => v.iter().flat_map(act_pages).collect(),
+    }
+}
+
+/// Applies one history entry to the effective list: an item replaces its predecessor in place (z-order), a new one goes on top.
+fn replay(v: &mut Vec<Item>, a: &Act) {
+    match a {
+        Act::Set(it) => {
+            let same = |x: &Item| match (x, it) {
+                (Item::Para(p), Item::Para(q)) => p.page == q.page && p.para == q.para,
+                (Item::Obj(p), Item::Obj(q)) => p.id == q.id,
+                (Item::Mv(p), Item::Mv(q)) => p.page == q.page && p.kind == q.kind && p.id == q.id,
+                (Item::Wm(p), Item::Wm(q)) => p.id == q.id,
+                (Item::Hf(p), Item::Hf(q)) => p.id == q.id,
+                _ => false,
+            };
+            match v.iter().position(same) {
+                Some(i) => v[i] = it.clone(),
+                None => v.push(it.clone()),
+            }
+        }
+        Act::Del(_, id) => v.retain(|x| match x {
+            Item::Obj(o) => o.id != *id,
+            Item::Wm(w) => w.id != *id,
+            Item::Hf(h) => h.id != *id,
+            _ => true,
+        }),
+        Act::Batch(b) => b.iter().for_each(|a| replay(v, a)),
+    }
+}
+
+/// Analysis-frame (y up) box -> displayed page, [x, y, w, h] with a top-left origin.
+fn disp_of_work(pa: &PageAn, b: [f64; 4]) -> [f64; 4] {
+    let t = pa.to_disp;
+    let pts = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])].map(|(x, y)| (x * t[0] + y * t[2] + t[4], x * t[1] + y * t[3] + t[5]));
+    let (x0, x1) = (pts.iter().map(|p| p.0).fold(f64::MAX, f64::min), pts.iter().map(|p| p.0).fold(f64::MIN, f64::max));
+    let (y0, y1) = (pts.iter().map(|p| p.1).fold(f64::MAX, f64::min), pts.iter().map(|p| p.1).fold(f64::MIN, f64::max));
+    [x0, pa.disp[1] - y1, x1 - x0, y1 - y0]
+}
+
+/// A move on the displayed page (pt, y down) as a move in the analysis frame (y up).
+fn disp_delta_to_work(pa: &PageAn, dx: f64, dy: f64) -> (f64, f64) {
+    let w = inv_m(pa.to_disp);
+    (dx * w[0] - dy * w[2], dx * w[1] - dy * w[3])
 }
 
 /// Line breaks normalised, runs of blanks collapsed to one space (hard breaks stay).
@@ -1078,6 +1668,13 @@ fn same_render(a: &Path, b: &Path) -> bool {
     true
 }
 
+/// All text of one page of a PDF, by pdfium (empty when it can't be read).
+fn text_of_page(bytes: &[u8], pg: u32) -> String {
+    let Ok(p) = pdf::pdfium() else { return String::new() };
+    let Ok(d) = p.load_pdf_from_byte_vec(bytes.to_vec(), None) else { return String::new() };
+    d.pages().get(pg as PdfPageIndex).ok().and_then(|pg| pg.text().ok().map(|t| t.all())).unwrap_or_default()
+}
+
 fn chars_of(s: &str) -> HashMap<char, usize> {
     let mut m = HashMap::new();
     for c in s.chars().filter(|c| !c.is_whitespace()) {
@@ -1090,7 +1687,10 @@ fn chars_of(s: &str) -> HashMap<char, usize> {
 /// A white-out to check on the output: page, display rect (top-left origin), user space -> display (y up) matrix, display height.
 type WoCheck = (u32, [f64; 4], content::M, f64);
 
-fn verify(out: &Path, pages: usize, edits: &[(u32, String)], wos: &[WoCheck]) -> Result<(), String> {
+/// A removed paragraph to look for in the output: page, its text without blanks, how often that text occurs on the original page.
+type GoneCheck = (u32, String, usize);
+
+fn verify(out: &Path, pages: usize, edits: &[(u32, String)], wos: &[WoCheck], gone: &[GoneCheck]) -> Result<(), String> {
     let p = pdf::pdfium()?;
     let d = p.load_pdf_from_file(out, None).map_err(|_| "verify".to_string())?;
     if d.pages().len() as usize != pages {
@@ -1107,6 +1707,14 @@ fn verify(out: &Path, pages: usize, edits: &[(u32, String)], wos: &[WoCheck]) ->
             }
         }
         if want.iter().any(|(c, n)| have.get(c).copied().unwrap_or(0) < *n) {
+            return Err("verify".into());
+        }
+    }
+    // a removed paragraph must occur less often than it did
+    for pg in gone.iter().map(|g| g.0).collect::<HashSet<_>>() {
+        let page = d.pages().get(pg as PdfPageIndex).map_err(|_| "verify".to_string())?;
+        let text: String = page.text().map(|t| t.all()).map_err(|_| "verify".to_string())?.chars().filter(|c| !c.is_whitespace()).collect();
+        if gone.iter().any(|g| g.0 == pg && text.matches(g.1.as_str()).count() >= g.2) {
             return Err("verify".into());
         }
     }
@@ -1131,6 +1739,26 @@ fn verify(out: &Path, pages: usize, edits: &[(u32, String)], wos: &[WoCheck]) ->
     Ok(())
 }
 
+/// The output with a fresh document id: ID[0] stays the input's (permanent id), ID[1] = 16 bytes of sha256(old ID[1], output hash, time).
+/// Viewers like Acrobat key their caches (extracted text) on the id, so an edited file must not look like the original.
+fn renew_id(bytes: &[u8], input: &Document) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+    let ids: Vec<Vec<u8>> = input.trailer.get(b"ID").ok().and_then(|o| o.as_array().ok()).map(|a| a.iter().filter_map(|o| if let Object::String(s, _) = o { Some(s.clone()) } else { None }).collect()).unwrap_or_default();
+    let hash = Sha256::digest(bytes);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(ids.get(1).cloned().unwrap_or_default());
+    h.update(hash);
+    h.update(nanos.to_le_bytes());
+    let id1 = h.finalize()[..16].to_vec();
+    let id0 = ids.first().cloned().unwrap_or_else(|| Sha256::digest([&hash[..], b"id0"].concat())[..16].to_vec());
+    let mut doc = Document::load_mem(bytes).map_err(|e| e.to_string())?;
+    doc.trailer.set("ID", Object::Array(vec![Object::String(id0, lopdf::StringFormat::Hexadecimal), Object::String(id1, lopdf::StringFormat::Hexadecimal)]));
+    let mut out = Vec::new();
+    doc.save_to(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 impl Session {
     fn save(&mut self, out_dir: &Path) -> Result<EditSaveRes, String> {
         let start = std::time::Instant::now();
@@ -1152,12 +1780,28 @@ impl Session {
                     }
                     Item::Obj(o) if o.kind == ObjKind::TextBox => v.push((b.info.get(&o.page).and_then(|i| i.objs.get(&o.id)).copied(), Some(o.text.clone()))),
                     Item::Obj(o) => v.push((Some(o.rect), None)),
+                    _ => v.push((None, None)),
                 }
             }
             v
         };
+        // paragraphs taken out with the Select tool
+        let removed: HashSet<(u32, u32)> = edits.iter().filter_map(|x| if let Item::Mv(m) = x { (m.kind == IKind::Para && m.removed).then_some((m.page, m.id)) } else { None }).collect();
+        let mut gone: Vec<GoneCheck> = vec![];
+        for &(pg, id) in &removed {
+            let pa = self.page(pg)?;
+            let want: String = pa.paras.get(id as usize).map(|p| p.text.chars().filter(|c| !c.is_whitespace()).collect()).unwrap_or_default();
+            let have: String = text_of_page(&self.orig, pg).chars().filter(|c| !c.is_whitespace()).collect();
+            let n = if want.chars().count() >= 8 { have.matches(want.as_str()).count() } else { 0 };
+            if n > 0 {
+                gone.push((pg, want, n));
+            }
+        }
         let hit = |a: [f64; 4], c: [f64; 4]| a[0] < c[0] + c[2] && c[0] < a[0] + a[2] && a[1] < c[1] + c[3] && c[1] < a[1] + a[3];
         for (i, it) in edits.iter().enumerate() {
+            if matches!(it, Item::Para(e) if removed.contains(&(e.page, e.para))) {
+                continue;
+            }
             let later_text = |r: [f64; 4]| edits.iter().enumerate().skip(i + 1).any(|(j, x)| x.page() == it.page() && boxes[j].1.is_some() && boxes[j].0.is_none_or(|bb| hit(bb, r)));
             let later_wo = |r: [f64; 4]| edits.iter().enumerate().skip(i + 1).any(|(j, x)| matches!(x, Item::Obj(o) if o.kind == ObjKind::WhiteOut) && x.page() == it.page() && boxes[j].0.is_some_and(|bb| hit(bb, r)));
             match it {
@@ -1197,8 +1841,9 @@ impl Session {
                 }
             }
             let pages = self.sizes.len();
-            verify(&chosen, pages, &words, &wo_checks)?;
-            std::fs::copy(&chosen, &tmp).map_err(|e| e.to_string())?;
+            verify(&chosen, pages, &words, &wo_checks, &gone)?;
+            let out = renew_id(&std::fs::read(&chosen).map_err(|e| e.to_string())?, &self.doc)?;
+            std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
             let stem = self.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "output".into());
             let dest = place(&tmp, out_dir, &stem, "_edited", "pdf")?;
             Ok(EditSaveRes { output: dest.display().to_string(), size: size_of(&dest), seconds: start.elapsed().as_secs_f64() })
@@ -1237,6 +1882,31 @@ pub async fn edit_render(page: u32, width_px: u32) -> Result<String, String> {
 #[tauri::command]
 pub async fn edit_apply(req: EditApplyReq) -> Result<EditApplyRes, String> {
     tauri::async_runtime::spawn_blocking(move || with_session(|s| s.apply(&req))).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn edit_apply_batch(req: EditBatchReq) -> Result<BatchRes, String> {
+    tauri::async_runtime::spawn_blocking(move || with_session(|s| s.apply_batch(&req))).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn edit_watermark(req: WmReq) -> Result<DocRes, String> {
+    tauri::async_runtime::spawn_blocking(move || with_session(|s| s.apply_wm(&req))).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn edit_header_footer(req: HfReq) -> Result<DocRes, String> {
+    tauri::async_runtime::spawn_blocking(move || with_session(|s| s.apply_hf(&req))).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn edit_doc_objs() -> Result<DocObjs, String> {
+    tauri::async_runtime::spawn_blocking(move || with_session(|s| Ok(s.doc_objs()))).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn edit_delete_doc_obj(id: u32) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || with_session(|s| s.del_doc(id).map(|_| serde_json::json!({ "kind": "ok" })))).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

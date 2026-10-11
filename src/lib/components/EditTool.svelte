@@ -6,7 +6,7 @@
   import { chooseFiles } from "../tauri";
   import { addFilesToTool } from "../files";
   import { isLocked } from "../compress";
-  import { openFor, applyEditor, undo, redo, startSave, keepEditing, chooseAnother, confirmLeave, cancelLeave, closeEditor, setTool, escTool, clearSel, deleteSel, nudge, openBoxEditor, type Obj } from "../edit";
+  import { openFor, applyEditor, undo, redo, startSave, keepEditing, chooseAnother, confirmLeave, cancelLeave, closeEditor, setTool, escTool, clearSel, deleteSel, nudge, openBoxEditor, togglePanel, type Obj } from "../edit";
   import ToolFrame from "./ToolFrame.svelte";
   import PasswordForm from "./PasswordForm.svelte";
   import SignedDialog from "./SignedDialog.svelte";
@@ -18,6 +18,8 @@
   import FormatPanel from "./FormatPanel.svelte";
   import SigPopover from "./SigPopover.svelte";
   import SigDraw from "./SigDraw.svelte";
+  import WatermarkPanel from "./WatermarkPanel.svelte";
+  import HeaderFooterPanel from "./HeaderFooterPanel.svelte";
 
   const e = app.edit;
   const PX = 96 / 72; // px per pt at 100 %
@@ -65,6 +67,14 @@
   });
   const goPage = (i: number) => scroller?.querySelector(`#ep-${i}`)?.scrollIntoView({ block: "start" });
 
+  // Once per session: a Behind watermark that some page forces to the front.
+  $effect(() => {
+    if (!e.scanShown && e.wm.id !== null && e.wm.layer === "behind" && Object.values(e.models).some((m) => m.wm_forced_front)) {
+      e.scanShown = true;
+      e.scanNote = true;
+    }
+  });
+
   const scanNote = $derived(!!file?.scanned || Object.values(e.models).some((m) => m.scan));
   const canSave = $derived(ready && e.hist.count > 0 && !e.busy && !e.editing?.applying);
 
@@ -79,14 +89,21 @@
   }
 
   const TOOLS = [
+    ["select", "cursor", "editToolSelect"],
     ["text", "cursor-text", "editToolText"],
     ["add", "text-t", "editToolAdd"],
     ["wo", "eraser", "editToolWo"],
     ["sig", "signature", "editToolSig"],
   ] as const;
+  const DOC = [
+    ["wm", "drop-half", "wmTitle"],
+    ["hf", "rows", "hfTitle"],
+  ] as const;
   let sigBtn = $state<HTMLButtonElement>();
   const selObj = $derived<Obj | undefined>(e.sel ? e.models[e.sel.page]?.objs?.find((o) => o.id === e.sel!.id) : undefined);
-  const hint = $derived(({ text: "editHint", add: "editHintAdd", wo: "editHintWo", sig: "editHintSig" } as const)[e.tool]);
+  const nSel = $derived(e.isel?.items.length ?? 0);
+  const hasSel = $derived(!!selObj || nSel > 0);
+  const hint = $derived(({ select: "editHintSelect", text: "editHint", add: "editHintAdd", wo: "editHintWo", sig: "editHintSig" } as const)[e.tool]);
 
   // Esc: cancel the open editor, else back to Edit text, else deselect. Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, Delete and arrows
   // when no editor (or other field) has focus.
@@ -96,6 +113,9 @@
       if (e.editing) {
         ev.preventDefault();
         closeEditor(); // Esc cancels even when focus sits on a bar button
+      } else if (e.tool === "select" && !e.sigOpen && !e.woBar && (e.sel || e.isel)) {
+        ev.preventDefault();
+        clearSel(); // Select tool: the first Esc deselects, the next one returns to Edit text
       } else if (e.tool !== "text" || e.sigOpen || e.woBar || e.sel) {
         ev.preventDefault();
         escTool();
@@ -115,7 +135,7 @@
       else if (k === "y" || (k === "z" && ev.shiftKey)) (ev.preventDefault(), void redo());
       return;
     }
-    if (!selObj || e.sigOpen) return;
+    if (!hasSel || e.sigOpen) return;
     const n = ev.shiftKey ? 10 : 1;
     const d = ({ ArrowLeft: [-n, 0], ArrowRight: [n, 0], ArrowUp: [0, -n], ArrowDown: [0, n] } as Record<string, [number, number]>)[ev.key];
     if (ev.key === "Delete" || ev.key === "Backspace") {
@@ -125,7 +145,7 @@
       deleteSel();
     }
     else if (d) (ev.preventDefault(), nudge(d[0], d[1]));
-    else if (ev.key === "Enter" && selObj.kind === "textbox" && e.sel) (ev.preventDefault(), openBoxEditor(e.sel.page, selObj.id));
+    else if (ev.key === "Enter" && selObj?.kind === "textbox" && e.sel) (ev.preventDefault(), openBoxEditor(e.sel.page, selObj.id));
   }
 
   // A click anywhere outside the open editor applies it. While a warning bar shows, a stray click does nothing
@@ -153,7 +173,7 @@
   <DoneCard
     subtitle={t("doneSubEdit")}
     output={e.run.result.output}
-    meta={`${fmtSize(e.run.result.size)} · ${e.run.result.seconds} s`}
+    meta={`${fmtSize(e.run.result.size)} · ${Math.max(1, Math.round(e.run.result.seconds))} s`}
     icon="file-pdf"
     anotherLabel={t("editKeep")}
     onanother={keepEditing}
@@ -256,7 +276,7 @@
           aria-label={t("editName")}
           style="flex-shrink:0;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--surface)"
         >
-          <div role="group" aria-label={t("editTools")} style="display:flex;padding:3px;border-radius:10px;background:var(--surface2);gap:2px">
+          <div role="group" aria-label={t("editTools")} style="display:flex;flex-wrap:wrap;max-width:100%;padding:3px;border-radius:10px;background:var(--surface2);gap:2px">
             {#each TOOLS as [id, icon, key] (id)}
               {@const on = e.tool === id}
               <button
@@ -266,6 +286,18 @@
                 aria-expanded={id === "sig" ? e.sigOpen : undefined}
                 onclick={() => setTool(id)}
                 style="min-height:32px;padding:0 10px;border-radius:7px;border:0;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;font-weight:600;white-space:nowrap;color:{on ? 'var(--accent-text)' : 'var(--text2)'};background:{on ? 'var(--surface)' : 'transparent'};box-shadow:{on ? '0 1px 2px rgba(0,0,0,.12)' : 'none'}"
+                ><i class="ph ph-{icon}" style="font-size:17px"></i>{t(key)}</button
+              >
+            {/each}
+          </div>
+          <span aria-hidden="true" style="width:1px;height:22px;background:var(--line);margin:0 4px"></span>
+          <div role="group" aria-label={t("editDocTools")} style="display:flex;gap:4px">
+            {#each DOC as [id, icon, key] (id)}
+              {@const on = e.panel === id}
+              <button
+                aria-pressed={on}
+                onclick={() => togglePanel(id)}
+                style="min-height:34px;padding:0 10px;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;font-weight:600;white-space:nowrap;border:1px solid {on ? 'var(--accent)' : 'var(--line2)'};color:{on ? 'var(--accent-text)' : 'var(--text)'};background:{on ? 'var(--accent-soft)' : 'var(--surface)'}"
                 ><i class="ph ph-{icon}" style="font-size:17px"></i>{t(key)}</button
               >
             {/each}
@@ -282,8 +314,22 @@
           <button style={tbtn} onclick={() => (zoom = "fit")} aria-pressed={zoom === "fit"}>{t("editFit")}</button>
           </div>
           <span style="flex:1"></span>
+          <button style="{tbtn};display:inline-flex;align-items:center" onclick={chooseOther} disabled={e.busy || !!e.editing}><i class="ph ph-file-plus" style="font-size:16px;margin-right:6px"></i>{t("otherFile")}</button>
           <span style="color:var(--text2);font-size:14px;font-variant-numeric:tabular-nums">{t("pageAria", { n: cur + 1 })} / {fmtNum(pages)}</span>
         </div>
+        <div style="flex:1;min-height:0;position:relative;display:flex;flex-direction:column">
+        {#if e.scanNote}
+          <div
+            role="status"
+            style="position:absolute;z-index:20;top:10px;right:26px;box-sizing:border-box;max-width:min(340px,calc(100% - 52px));display:flex;gap:10px;align-items:flex-start;padding:10px 8px 10px 12px;border-radius:12px;background:var(--surface);color:var(--text);border:1px solid var(--line2);box-shadow:var(--shadow);font-size:14px;line-height:1.4"
+          >
+            <i class="ph ph-info" style="font-size:20px;flex-shrink:0;margin-top:1px;color:var(--accent-text)"></i>
+            <span style="flex:1;min-width:0;overflow-wrap:anywhere">{t("editWmScanNote")}</span>
+            <button aria-label={t("close")} title={t("close")} onclick={() => (e.scanNote = false)} style="flex-shrink:0;width:28px;height:28px;border-radius:8px;border:0;background:none;color:var(--text2);cursor:pointer;display:grid;place-items:center"
+              ><i class="ph ph-x" style="font-size:16px"></i></button
+            >
+          </div>
+        {/if}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           bind:this={scroller}
@@ -295,6 +341,7 @@
           {#each { length: pages } as _, i (i)}
             <EditPage {i} {scale} />
           {/each}
+        </div>
         </div>
       </div>
     </div>
@@ -325,10 +372,24 @@
 
 {#snippet options()}
   {#if ready}
-    {#if e.fmt}<FormatPanel />{/if}
-    <div style="color:var(--text2)">{t(hint)}</div>
-    {#if selObj}
-      <button style="{btn};color:var(--err);align-self:flex-start" onclick={deleteSel} disabled={e.busy}><i class="ph ph-trash" style="font-size:16px"></i>{t("objDelete")}</button>
+    {#if e.panel === "wm"}
+      <WatermarkPanel />
+    {:else if e.panel === "hf"}
+      <HeaderFooterPanel />
+    {:else}
+      {#if e.fmt}<FormatPanel />{/if}
+      <div style="color:var(--text2)">{t(hint)}</div>
+      {#if nSel}
+        <div aria-live="polite" style="font-weight:600;color:var(--accent-text)">{t("editSelCount", { n: fmtNum(nSel) })}</div>
+        {#if e.isel?.items.some((x) => x.kind === "path")}
+          <div role="note" style="display:flex;gap:10px;padding:12px 14px;border-radius:12px;background:var(--accent-soft);color:var(--accent-text);font-size:14.5px">
+            <i class="ph ph-info" style="font-size:20px;flex-shrink:0;margin-top:1px"></i>{t("editSelPathsNote")}
+          </div>
+        {/if}
+      {/if}
+      {#if hasSel}
+        <button style="{btn};color:var(--err);align-self:flex-start" onclick={deleteSel} disabled={e.busy}><i class="ph ph-trash" style="font-size:16px"></i>{t("objDelete")}</button>
+      {/if}
     {/if}
     {#if e.objError}
       <div role="alert" style="padding:10px 12px;border-radius:12px;background:var(--err-soft);font-size:14.5px;overflow-wrap:anywhere">{e.objError}</div>

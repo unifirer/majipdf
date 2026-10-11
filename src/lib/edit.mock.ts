@@ -2,7 +2,8 @@
 // behind `import.meta.env.DEV && !inTauri`; delete this file plus the `mock` branches in edit.ts to remove it.
 // All text is made up. Magic inputs: "@" -> missing_chars (and bold on a direct paragraph without the PC font), "Ω" -> unsupported_chars, "OVERFLOW" -> overflow, "PUSH" -> cannot_push.
 // White-out over a locked / PC-font paragraph -> whiteout_partial (unless cover_only).
-import type { EditOpenReq, EditApplyReq, EditApplyRes, EditDoc, EditHistory, EditSaveReq, EditSaveRes, ObjReq, ObjRes, Obj, PageModel, Para, Rect, Run, SigItem, Style } from "./edit";
+import type { EditOpenReq, EditApplyReq, EditApplyRes, EditDoc, EditHistory, EditSaveReq, EditSaveRes, ObjReq, ObjRes, Obj, PageModel, Para, Rect, Run, SigItem, Style, Item, ObjEdit3, BatchRes, WmReq, HfReq, DocRes, DocObjs } from "./edit";
+import { parseRanges } from "./split";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const W = 595;
@@ -27,9 +28,23 @@ const fit = (p: Para) => {
   p.bbox[3] = Math.max(1, Math.ceil(p.text.length / perLine)) * p.pitch;
   return p;
 };
+// Existing images and paths (Edit 3). `art` is mock-only: how the fake renderer draws the item. Path 40 is "tied to other content" (move -> cannot_move).
+type Art = Item & { art: string; tied?: boolean };
+const img = (id: number, bbox: Rect, art: string, locked: string | null = null): Art => ({ id, kind: "image", bbox, rot: 0, locked, art });
+const line = (id: number, bbox: Rect, art = "line", tied = false): Art => ({ id, kind: "path", bbox, rot: 0, locked: null, art, tied });
+const tableLines = (): Art[] => {
+  const out: Art[] = [];
+  [520, 550, 580, 610].forEach((y, k) => out.push(line(10 + k, [72, y - 0.25, 451, 0.5])));
+  [72, 184.75, 297.5, 410.25, 523].forEach((x, k) => out.push(line(20 + k, [x - 0.25, 520, 0.5, 90])));
+  for (let k = 0; k < 10; k++) out.push(line(30 + k, [72 + k * 24, 650, 12, 0.5], "dash")); // tiny pieces of one dashed rule
+  out.push(line(40, [330, 700, 90, 0.5], "line", true));
+  out.push(line(41, [72, 680, 120, 40], "shape"));
+  return out;
+};
 const initial = (): PageModel[] => [
   {
-    page: 0, scan: false, objs: [],
+    page: 0, scan: false, objs: [], wm_forced_front: false,
+    items: [img(1, [430, 26, 90, 44], "logo"), img(2, [250, 738, 90, 40], "stamp", "form"), ...tableLines()],
     paras: [
       para(0, 80, "Laporan Contoh Kegiatan Tahunan", { align: "center", size: 18, pitch: 22, bold: true, bbox: [72, 80, 451, 22] }),
       para(1, 130, LOREM, { align: "justified", css_font: "Times New Roman" }),
@@ -45,7 +60,8 @@ const initial = (): PageModel[] => [
     ].map(fit),
   },
   {
-    page: 1, scan: false, objs: [],
+    page: 1, scan: false, objs: [], wm_forced_front: false,
+    items: [img(1, [72, 330, 220, 140], "photo"), line(10, [72, 500, 451, 0.5]), line(11, [72, 520, 451, 0.5])],
     paras: [
       para(0, 80, "Lampiran", { size: 16, pitch: 20, bold: true, bbox: [72, 80, 451, 20] }),
       para(1, 120, LOREM.slice(0, 160), { marker: "1.", bbox: [96, 120, 427, 14] }),
@@ -59,33 +75,46 @@ const initial = (): PageModel[] => [
 ];
 
 // ---- history: a snapshot per step (the mock has no byte-level undo) ----
+// Edit 3: `pages[i].items` holds only the images and paths (with a mock-only `art`); paragraph items are derived by mdl().
+type Doc = { wm: WmReq | null; hfs: HfReq[] };
 let pages: PageModel[] = initial();
-let snaps: string[] = [JSON.stringify(pages)];
+let doc: Doc = { wm: null, hfs: [] };
+const snap = () => JSON.stringify({ pages, doc });
+let snaps: string[] = [snap()];
 let cur = 0;
 let nextId = 100;
 
 const push = () => {
   snaps = snaps.slice(0, cur + 1);
-  snaps.push(JSON.stringify(pages));
+  snaps.push(snap());
   cur++;
 };
+const restore = (s: string) => ({ pages, doc } = JSON.parse(s) as { pages: PageModel[]; doc: Doc });
 const hist = (): EditHistory => ({
   can_undo: cur > 0,
   can_redo: cur < snaps.length - 1,
   count: cur,
-  changed_pages: pages.map((p, i) => i).filter((i) => JSON.stringify((JSON.parse(snaps[0]) as PageModel[])[i]) !== JSON.stringify(pages[i])),
+  changed_pages: pages.map((p, i) => i).filter((i) => JSON.stringify((JSON.parse(snaps[0]).pages as PageModel[])[i]) !== JSON.stringify(pages[i])),
 });
+
+// What the backend reports for a page: paragraph items (same ids) plus the stored images/paths; forced-front flag for the scan-like page 2.
+const mdl = (i: number): PageModel => {
+  const p = pages[i];
+  const paraItems: Item[] = p.paras.map((x) => ({ id: x.id, kind: "para", bbox: [...x.bbox] as Rect, rot: x.rot, locked: x.status === "locked" ? (x.reason ?? "structure") : null }));
+  return { ...structuredClone(p), items: [...paraItems, ...structuredClone(p.items)], wm_forced_front: !!doc.wm && doc.wm.layer === "behind" && i === 1 };
+};
 
 export async function open(_r: EditOpenReq): Promise<EditDoc> {
   await sleep(500);
   pages = initial();
-  snaps = [JSON.stringify(pages)];
+  doc = { wm: null, hfs: [] };
+  snaps = [snap()];
   cur = 0;
   return { pages: 2, sizes: [[W, H], [W, H]] };
 }
 export async function page(i: number): Promise<PageModel> {
   await sleep(60);
-  return structuredClone(pages[i]);
+  return mdl(i);
 }
 
 // ---- library ----
@@ -179,6 +208,48 @@ const objSvg = (o: Obj) => {
   const tx = lines.map((l, i) => `<text x="${ax}" y="${y + (i + 0.8) * st.size * 1.15}" text-anchor="${anchor}">${esc(l)}</text>`).join("");
   return `<g font-family="${esc(fam)}" font-size="${st.size}" font-weight="${st.bold ? 700 : 400}" font-style="${st.italic ? "italic" : "normal"}" fill="${st.color}">${tx}</g>`;
 };
+const artSvg = (a: Art) => {
+  const [x, y, w, h] = a.bbox;
+  if (a.art === "logo") return `<g><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="#2f6f8f"/><text x="${x + w / 2}" y="${y + h / 2 + 5}" font-family="Arial" font-weight="700" font-size="16" fill="#fff" text-anchor="middle">LOGO</text></g>`;
+  if (a.art === "stamp") return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="none" stroke="#B45309" stroke-width="2"/><text x="${x + w / 2}" y="${y + h / 2 + 4}" font-family="Arial" font-size="11" fill="#B45309" text-anchor="middle">FORM STAMP</text>`;
+  if (a.art === "photo") return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#bcd3c4"/><path d="M${x} ${y + h} L${x + w * 0.35} ${y + h * 0.35} L${x + w * 0.6} ${y + h * 0.75} L${x + w * 0.8} ${y + h * 0.5} L${x + w} ${y + h} Z" fill="#6f9a7e"/><circle cx="${x + w * 0.8}" cy="${y + h * 0.22}" r="${h * 0.1}" fill="#f2d16b"/>`;
+  if (a.art === "shape") return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#E3EEF5" stroke="#35607f" stroke-width="1"/>`;
+  return `<rect x="${x}" y="${y}" width="${Math.max(w, 0.5)}" height="${Math.max(h, 0.5)}" fill="${a.art === "dash" ? "#a0522d" : "#222"}"/>`;
+};
+const wmSvg = (w: WmReq, i: number) => {
+  if (w.pages && !pageIn(w.pages, i)) return "";
+  const cx = W / 2;
+  const cy = H / 2;
+  const a = (w.angle * Math.PI) / 180;
+  if (w.kind === "image") {
+    const iw = (W * (w.scale ?? 50)) / 100;
+    const src = assetUrl.get(w.asset ?? "") ?? "";
+    return `<g opacity="${w.opacity}" transform="rotate(${-w.angle} ${cx} ${cy})"><image href="${esc(src)}" x="${cx - iw / 2}" y="${cy - iw / 2}" width="${iw}" height="${iw}" preserveAspectRatio="xMidYMid meet"/></g>`;
+  }
+  const st = w.style!;
+  const len = Math.max(1, (w.text ?? "").length);
+  const lmax = 0.9 * Math.min(W / Math.max(Math.abs(Math.cos(a)), 0.01), H / Math.max(Math.abs(Math.sin(a)), 0.01));
+  const fs = st.size > 0 ? st.size : Math.min(W * 0.15, lmax / (len * 0.66));
+  return `<text x="${cx}" y="${cy + fs * 0.35}" transform="rotate(${-w.angle} ${cx} ${cy})" text-anchor="middle" font-family="${esc(st.font)}" font-size="${fs}" font-weight="${st.bold ? 700 : 400}" font-style="${st.italic ? "italic" : "normal"}" fill="${st.color}" opacity="${w.opacity}">${esc(w.text ?? "")}</text>`;
+};
+const pageIn = (ranges: string, i: number) => {
+  const r = parseRanges(ranges, 2);
+  return "groups" in r && r.groups.some((g) => i + 1 >= g.from && i + 1 <= g.to);
+};
+const hfSvg = (i: number) =>
+  doc.hfs
+    .map((h) => {
+      const inc = [0, 1].filter((p) => !h.pages || pageIn(h.pages, p));
+      const idx = inc.indexOf(i);
+      if (idx < 0 || (h.skip_first && idx === 0)) return "";
+      const date = new Date().toLocaleDateString(h.lang === "id" ? "id-ID" : "en-GB", { day: "numeric", month: "long", year: "numeric" });
+      const txt = h.template.replaceAll("{page}", String(h.start + idx)).replaceAll("{total}", String(inc.length + h.start - 1)).replaceAll("{date}", date).replaceAll("{date_id}", new Date().toLocaleDateString("id-ID", { day: "numeric", month: "long", year: "numeric" })).replaceAll("{date_en}", new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })).replaceAll("{file}", "Laporan_Contoh");
+      const x = h.pos[1] === "l" ? h.margin_pt : h.pos[1] === "c" ? W / 2 : W - h.margin_pt;
+      const y = h.pos[0] === "t" ? h.margin_pt + h.style.size * 0.8 : H - h.margin_pt;
+      const an = h.pos[1] === "l" ? "start" : h.pos[1] === "c" ? "middle" : "end";
+      return `<text x="${x}" y="${y}" text-anchor="${an}" font-family="${esc(h.style.font)}" font-size="${h.style.size}" font-weight="${h.style.bold ? 700 : 400}" font-style="${h.style.italic ? "italic" : "normal"}" fill="${h.style.color}">${esc(txt)}</text>`;
+    })
+    .join("");
 export async function render(i: number, widthPx: number): Promise<string> {
   await sleep(250);
   const k = widthPx / W;
@@ -194,7 +265,10 @@ export async function render(i: number, widthPx: number): Promise<string> {
     })
     .join("");
   const objs = pages[i].objs.map(objSvg).join("");
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${widthPx}" height="${Math.round(H * k)}" viewBox="0 0 ${W} ${H}"><rect width="100%" height="100%" fill="#fff"/>${bars}${objs}</svg>`;
+  const arts = (pages[i].items as Art[]).map(artSvg).join("");
+  const wm = doc.wm ? wmSvg(doc.wm, i) : "";
+  const front = !!doc.wm && (doc.wm.layer === "front" || i === 1); // page 2 pretends to be a scan: always in front
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${widthPx}" height="${Math.round(H * k)}" viewBox="0 0 ${W} ${H}"><rect width="100%" height="100%" fill="#fff"/>${front ? "" : wm}${bars}${arts}${objs}${front ? wm : ""}${hfSvg(i)}</svg>`;
   return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
 }
 
@@ -221,7 +295,7 @@ export async function apply(r: EditApplyReq): Promise<EditApplyRes> {
   }
   fit(p);
   push();
-  return { kind: "ok", page: structuredClone(pages[r.page]) };
+  return { kind: "ok", page: mdl(r.page) };
 }
 const overlaps = (a: Rect, b: Rect) => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
 export async function applyObj(q: ObjReq): Promise<ObjRes> {
@@ -231,7 +305,7 @@ export async function applyObj(q: ObjReq): Promise<ObjRes> {
   if (q.kind === "delete") {
     if (at >= 0) pg.objs.splice(at, 1);
     push();
-    return { kind: "ok", page: structuredClone(pg), id: q.id ?? -1 };
+    return { kind: "ok", page: mdl(q.page), id: q.id ?? -1 };
   }
   const rect: Rect = [...q.rect!];
   const o: Obj = { id: at >= 0 ? pg.objs[at].id : nextId++, kind: q.kind, rect, rot: q.rot ?? 0, text: q.text, style: q.style ? { ...q.style } : undefined, asset: q.asset };
@@ -247,16 +321,16 @@ export async function applyObj(q: ObjReq): Promise<ObjRes> {
   if (at >= 0) pg.objs[at] = o;
   else pg.objs.push(o);
   push();
-  return { kind: "ok", page: structuredClone(pg), id: o.id };
+  return { kind: "ok", page: mdl(q.page), id: o.id };
 }
 export async function undo(): Promise<EditHistory> {
   await sleep(100);
-  if (cur > 0) pages = JSON.parse(snaps[--cur]);
+  if (cur > 0) restore(snaps[--cur]);
   return hist();
 }
 export async function redo(): Promise<EditHistory> {
   await sleep(100);
-  if (cur < snaps.length - 1) pages = JSON.parse(snaps[++cur]);
+  if (cur < snaps.length - 1) restore(snaps[++cur]);
   return hist();
 }
 export const history = async (): Promise<EditHistory> => hist();
@@ -265,3 +339,68 @@ export async function save(_r: EditSaveReq): Promise<EditSaveRes> {
   return { output: "C:/mock/Laporan_Contoh_edited.pdf", size: 210 * 1024, seconds: 2 };
 }
 export async function close(): Promise<void> {}
+
+// ---- Edit 3: existing items, watermark, header & footer ----
+export async function applyBatch(edits: ObjEdit3[]): Promise<BatchRes> {
+  await sleep(250);
+  for (const ed of edits) {
+    const it = ed.item.kind === "para" ? undefined : (pages[ed.page].items as Art[]).find((x) => x.kind === ed.item.kind && x.id === ed.item.id);
+    if (ed.kind === "move" && it?.tied) return { kind: "cannot_move", page: ed.page, item: ed.item };
+  }
+  const touched = new Set<number>();
+  for (const ed of edits) {
+    const pg = pages[ed.page];
+    touched.add(ed.page);
+    if (ed.item.kind === "para") {
+      const at = pg.paras.findIndex((x) => x.id === ed.item.id);
+      if (at < 0) continue;
+      if (ed.kind === "move") (pg.paras[at].bbox[0] += ed.dx), (pg.paras[at].bbox[1] += ed.dy);
+      else if (ed.kind === "remove") pg.paras.splice(at, 1);
+      continue;
+    }
+    const at = pg.items.findIndex((x) => x.kind === ed.item.kind && x.id === ed.item.id);
+    if (at < 0) continue;
+    if (ed.kind === "move") (pg.items[at].bbox[0] += ed.dx), (pg.items[at].bbox[1] += ed.dy);
+    else if (ed.kind === "resize") pg.items[at].bbox = [...ed.rect] as Rect;
+    else pg.items.splice(at, 1);
+  }
+  push();
+  return { kind: "ok", pages: [...touched].map(mdl) };
+}
+
+const badPages = (ranges: string): DocRes | null => {
+  if (!ranges.trim()) return null;
+  const r = parseRanges(ranges, 2);
+  return "error" in r ? { kind: "bad_pages", reason: `Bad page range "${ranges}"` } : null;
+};
+export async function watermark(r: WmReq): Promise<DocRes> {
+  await sleep(250);
+  const bad = badPages(r.pages);
+  if (bad) return bad;
+  if (r.text?.includes("Ω")) return { kind: "unsupported_chars", chars: "Ω" };
+  const id = doc.wm?.id ?? nextId++;
+  doc.wm = { ...structuredClone(r), id };
+  push();
+  return { kind: "ok", id, changed: "all" };
+}
+export async function headerFooter(r: HfReq): Promise<DocRes> {
+  await sleep(250);
+  const bad = badPages(r.pages);
+  if (bad) return bad;
+  if (r.template.includes("Ω")) return { kind: "unsupported_chars", chars: "Ω" };
+  const at = r.id === null ? -1 : doc.hfs.findIndex((x) => x.id === r.id);
+  const id = at >= 0 ? doc.hfs[at].id! : nextId++;
+  if (at >= 0) doc.hfs[at] = { ...structuredClone(r), id };
+  else doc.hfs.push({ ...structuredClone(r), id });
+  push();
+  return { kind: "ok", id, changed: "all" };
+}
+export async function docObjs(): Promise<DocObjs> {
+  return structuredClone({ watermarks: doc.wm ? [doc.wm] : [], header_footers: doc.hfs });
+}
+export async function deleteDocObj(id: number): Promise<void> {
+  await sleep(150);
+  if (doc.wm?.id === id) doc.wm = null;
+  doc.hfs = doc.hfs.filter((x) => x.id !== id);
+  push();
+}

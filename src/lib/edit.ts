@@ -1,8 +1,9 @@
 // Edit PDF (inline text editing): contract types, command wrappers and state-backed session logic.
 // See _docs/edit-contract.md. The backend keeps the session (and the job guard) from edit_open until edit_close.
-import { app, settings, openTool, settled, setLeaveHook, type FileInfo, type EditTool } from "./state.svelte";
+import { app, settings, openTool, settled, setLeaveHook, newWm, newSpot, newHf, HF_POS, type FileInfo, type EditTool, type HfSpot } from "./state.svelte";
 import { inTauri } from "./tauri";
 import { t } from "./i18n";
+import { parseRanges } from "./split";
 import { sameStyle, textOf, mergeRuns, applyRange, styleOver, normRuns } from "./rich";
 
 // Edit 2 (see _docs/edit2-contract.md)
@@ -23,6 +24,7 @@ export interface EditOpenReq { path: string; password: string | null }
 export interface EditDoc { pages: number; sizes: [number, number][] }
 export interface Para {
   id: number;
+  removed?: boolean; // removed in the Select tool: kept for its id, never drawn
   bbox: [number, number, number, number]; // pt, top-left origin: x, y, w, h
   text: string;
   marker: string | null;
@@ -43,7 +45,20 @@ export interface Para {
   runs: Run[];
   orig_font_name: string;
 }
-export interface PageModel { page: number; paras: Para[]; scan: boolean; objs: Obj[] }
+// Edit 3 (see _docs/edit3-contract.md)
+export interface ItemRef { kind: "para" | "image" | "path"; id: number }
+export interface Item extends ItemRef { bbox: Rect; rot: number; locked: string | null }
+export type ObjEdit3 =
+  | { kind: "move"; page: number; item: ItemRef; dx: number; dy: number }
+  | { kind: "resize"; page: number; item: ItemRef; rect: Rect }
+  | { kind: "remove"; page: number; item: ItemRef };
+export type BatchRes = { kind: "ok"; pages: PageModel[] } | { kind: "cannot_move"; page: number; item: ItemRef };
+export type HfPos = "tl" | "tc" | "tr" | "bl" | "bc" | "br";
+export interface WmReq { id: number | null; kind: "text" | "image"; text?: string; style?: Style; asset?: string; scale?: number; opacity: number; angle: number; layer: "behind" | "front"; pages: string }
+export interface HfReq { id: number | null; pos: HfPos; template: string; style: Style; margin_pt: number; start: number; skip_first: boolean; pages: string; lang: "en" | "id"; tz_min: number }
+export type DocRes = { kind: "ok"; id: number; changed: "all" } | { kind: "bad_pages"; reason: string } | { kind: "unsupported_chars"; chars: string } | { kind: "too_long" } | { kind: "bad_text" };
+export interface DocObjs { watermarks: WmReq[]; header_footers: HfReq[] }
+export interface PageModel { page: number; paras: Para[]; scan: boolean; objs: Obj[]; items: Item[]; wm_forced_front: boolean }
 export interface EditApplyReq { page: number; para: number; text: string; use_pc_font: boolean; allow_overlap: boolean; style?: Style | null; runs?: Run[] | null }
 export type EditApplyRes =
   | { kind: "ok"; page: PageModel }
@@ -69,6 +84,11 @@ export const editRender = (page: number, widthPx: number): Promise<string> =>
   mock ? mock().then((m) => m.render(page, widthPx)) : invoke("edit_render", { page, widthPx });
 export const editApply = (req: EditApplyReq): Promise<EditApplyRes> => (mock ? mock().then((m) => m.apply(req)) : invoke("edit_apply", { req }));
 export const editApplyObj = (req: ObjReq): Promise<ObjRes> => (mock ? mock().then((m) => m.applyObj(req)) : invoke("edit_apply_obj", { req }));
+export const editApplyBatch = (edits: ObjEdit3[]): Promise<BatchRes> => (mock ? mock().then((m) => m.applyBatch(edits)) : invoke("edit_apply_batch", { req: { edits } }));
+export const editWatermark = (req: WmReq): Promise<DocRes> => (mock ? mock().then((m) => m.watermark(req)) : invoke("edit_watermark", { req }));
+export const editHeaderFooter = (req: HfReq): Promise<DocRes> => (mock ? mock().then((m) => m.headerFooter(req)) : invoke("edit_header_footer", { req }));
+export const editDocObjs = (): Promise<DocObjs> => (mock ? mock().then((m) => m.docObjs()) : invoke("edit_doc_objs"));
+export const editDeleteDocObj = (id: number): Promise<void> => (mock ? mock().then((m) => m.deleteDocObj(id)) : invoke("edit_delete_doc_obj", { id }));
 export const editFonts = (): Promise<string[]> => (mock ? mock().then((m) => m.fonts()) : invoke("edit_fonts"));
 export const sigList = (): Promise<SigItem[]> => (mock ? mock().then((m) => m.sigList()) : invoke("sig_list"));
 export const sigImport = (path: string, kind: SigItem["kind"]): Promise<SigItem> => (mock ? mock().then((m) => m.sigImport(path, kind)) : invoke("sig_import", { path, kind }));
@@ -87,6 +107,8 @@ let tok = 0; // invalidates an in-flight open when the file changes
 let leaveAction: (() => void) | null = null;
 let fmtTimer: ReturnType<typeof setTimeout> | 0 = 0;
 const sticky = new Set<string>(); // targets that accepted "Use PC font": it is never asked again this session
+let wmT: ReturnType<typeof setTimeout> | 0 = 0;
+const hfT: Partial<Record<HfPos, ReturnType<typeof setTimeout>>> = {};
 let pend: Partial<Style> = {}; // format patches waiting for the debounce (selected text box, no editor)
 
 const pwOf = (f: FileInfo) => app.compress.passwords[f.path] ?? null;
@@ -104,6 +126,14 @@ function resetState() {
   e.editing = null;
   e.tool = "text";
   e.sel = null;
+  e.isel = null;
+  e.panel = null;
+  e.scanNote = false;
+  e.scanShown = false;
+  Object.assign(e.wm, newWm());
+  e.hf = newHf();
+  clearTimeout(wmT);
+  for (const k of HF_POS) clearTimeout(hfT[k]);
   e.fmt = null;
   e.armed = null;
   e.sigs = [];
@@ -156,6 +186,7 @@ export async function openFor(f: FileInfo) {
     e.hist = await editHistory();
     e.fonts = await editFonts().catch(() => []);
     await refreshSigs();
+    await loadDocObjs();
     e.stage = "ready";
   } catch (err) {
     if (my !== tok) return;
@@ -464,18 +495,24 @@ export async function applyObj(req: ObjReq): Promise<ObjRes | null> {
 
 export function selectObj(page: number, id: number) {
   if (e.editing) return;
+  e.isel = null;
   e.sel = { page, id };
   syncFmt();
 }
 export function clearSel() {
   if (e.editing) return;
+  if (ndT) (clearTimeout(ndT), (ndT = 0), flushNudge()); // arrows pressed just before Esc still apply
   e.sel = null;
+  e.isel = null;
   syncFmt();
 }
 export const moveObj = (page: number, o: Obj, rect: Rect) => applyObj(objReq(page, o, rect));
 export function deleteSel() {
   const s = e.sel;
-  if (s && !e.editing) void applyObj({ kind: "delete", page: s.page, id: s.id });
+  const is = e.isel;
+  if (e.editing) return;
+  if (is?.items.length) void runBatch(is.items.map((item) => ({ kind: "remove", page: is.page, item })));
+  else if (s) void applyObj({ kind: "delete", page: s.page, id: s.id });
 }
 export const addWhiteout = (page: number, rect: Rect) => applyObj({ kind: "whiteout", page, id: null, rect });
 export function coverOnly() {
@@ -487,7 +524,7 @@ export const dismissWo = () => (e.woBar = null);
 let nd: [number, number] = [0, 0];
 let ndT: ReturnType<typeof setTimeout> | 0 = 0;
 export function nudge(dx: number, dy: number) {
-  if (!selObj() || e.editing) return;
+  if ((!selObj() && !e.isel?.items.length) || e.editing) return;
   nd = [nd[0] + dx, nd[1] + dy];
   clearTimeout(ndT);
   ndT = setTimeout(flushNudge, 180);
@@ -500,7 +537,8 @@ function flushNudge() {
   const o = selObj();
   const [dx, dy] = nd;
   nd = [0, 0];
-  if (o && e.sel) void moveObj(e.sel.page, o, [o.rect[0] + dx, o.rect[1] + dy, o.rect[2], o.rect[3]]);
+  if (e.isel?.items.length) void moveItems(dx, dy);
+  else if (o && e.sel) void moveObj(e.sel.page, o, [o.rect[0] + dx, o.rect[1] + dy, o.rect[2], o.rect[3]]);
 }
 
 // ---- tools ----
@@ -551,8 +589,10 @@ async function step(fn: () => Promise<EditHistory>) {
     e.dirty = true;
     e.allGen++;
     e.sel = null;
+    e.isel = null;
     e.woBar = null;
     syncFmt();
+    await loadDocObjs();
   } catch {
     // ponytail: nothing to undo/redo (stale buttons); the next history call corrects them.
     await refreshHistory().catch(() => {});
@@ -597,4 +637,217 @@ export function startBox(page: number, x: number, y: number) {
   const len = Math.max(60, Math.min(200, (side ? sz[1] : sz[0]) - 36 - (side ? y : x)));
   const rect: Rect = side ? [Math.min(x, sz[0] - th - 4), Math.min(y, sz[1] - len - 4), th, len] : [Math.min(x, sz[0] - len - 4), Math.min(y, sz[1] - th - 4), len, th];
   openBoxEditor(page, null, rect, rot);
+}
+
+// ---- Edit 3: Select tool (existing paragraphs, images, lines & shapes) ----
+const ikey = (r: ItemRef) => r.kind + ":" + r.id;
+const sameItem = (a: ItemRef, b: ItemRef) => a.kind === b.kind && a.id === b.id;
+export const isSelItem = (page: number, it: ItemRef) => e.isel?.page === page && e.isel.items.some((x) => sameItem(x, it));
+export function selectItems(page: number, items: ItemRef[]) {
+  if (e.editing) return;
+  e.sel = null;
+  e.isel = items.length ? { page, items: items.map(({ kind, id }) => ({ kind, id })) } : null;
+  syncFmt();
+}
+export function toggleItem(page: number, it: ItemRef) {
+  const cur = e.isel?.page === page ? e.isel.items : [];
+  selectItems(page, cur.some((x) => sameItem(x, it)) ? cur.filter((x) => !sameItem(x, it)) : [...cur, it]);
+}
+function pruneIsel() {
+  const is = e.isel;
+  if (!is) return;
+  const have = new Set((e.models[is.page]?.items ?? []).map(ikey));
+  const keep = is.items.filter((x) => have.has(ikey(x)));
+  e.isel = keep.length ? { page: is.page, items: keep } : null;
+}
+// One batch = one history step. Returns true when applied.
+export async function runBatch(edits: ObjEdit3[]): Promise<boolean> {
+  if (e.busy || !edits.length) return false;
+  e.busy = true;
+  e.objError = "";
+  try {
+    const res = await editApplyBatch(edits);
+    if (res.kind !== "ok") {
+      e.objError = t("editCannotMove");
+      return false;
+    }
+    for (const m of res.pages) {
+      e.models[m.page] = m;
+      e.pgen[m.page] = (e.pgen[m.page] ?? 0) + 1;
+    }
+    e.dirty = true;
+    pruneIsel();
+    await refreshHistory();
+    return true;
+  } catch (err) {
+    e.objError = String(err);
+    return false;
+  } finally {
+    e.busy = false;
+  }
+}
+export function moveItems(dx: number, dy: number) {
+  const is = e.isel;
+  return is ? runBatch(is.items.map((item) => ({ kind: "move", page: is.page, item, dx, dy }))) : Promise.resolve(false);
+}
+export const resizeItem = (page: number, item: ItemRef, rect: Rect) => runBatch([{ kind: "resize", page, item, rect }]);
+
+// ---- Edit 3: watermark + header & footer (document-wide, live preview 300 ms after the last change) ----
+const lang = () => settings.lang as "en" | "id";
+export const HF_PRESETS = () => [
+  { tpl: "{page}", label: "1" },
+  { tpl: "{page} / {total}", label: "1 / 10" },
+  { tpl: "- {page} -", label: "- 1 -" },
+  lang() === "id" ? { tpl: "Halaman {page} dari {total}", label: "Halaman 1 dari 10" } : { tpl: "Page {page} of {total}", label: "Page 1 of 10" },
+];
+export const presetOf = (tpl: string) => HF_PRESETS().find((p) => p.tpl === tpl)?.tpl ?? "custom";
+
+// Page-range text -> message (Split rules and messages); "" when fine or still empty.
+export function rangeErr(allPages: boolean, ranges: string): string {
+  if (allPages || !ranges.trim() || !e.doc) return "";
+  const r = parseRanges(ranges, e.doc.pages);
+  return "error" in r ? t(r.error.key, r.error.params) : "";
+}
+// Backend range errors come as "rangeErrFormat:<token>" or "rangeErr:<page>:<pages>".
+const badPages = (reason: string) => {
+  const [k, a, b] = reason.split(":");
+  return k === "rangeErrFormat" ? t("rangeErrFormat", { x: reason.slice(k.length + 1) }) : k === "rangeErr" ? t("rangeErr", { p: a ?? "", max: b ?? "" }) : reason;
+};
+const pagesWire = (allPages: boolean, ranges: string): string | null => (allPages ? "" : ranges.trim() && !rangeErr(false, ranges) ? ranges.trim() : null);
+
+// Default header/footer look: the page's body style, 2 pt smaller (min 8), black.
+function hfBase(): Pick<HfSpot, "font" | "size" | "color" | "bold" | "italic"> {
+  const pg = e.models[0] ? 0 : Number(Object.keys(e.models)[0] ?? 0);
+  const d = defaultStyle(pg);
+  return { font: d.font, size: Math.max(8, Math.round((d.size - 2) * 2) / 2), color: "#000000", bold: false, italic: false };
+}
+function initSpots() {
+  const b = hfBase();
+  for (const k of HF_POS) {
+    const s = e.hf.spots[k];
+    if (s.id === null && !s.template) Object.assign(s, b);
+  }
+  const w = e.wm;
+  if (w.id === null && !w.text && !e.fonts.includes(w.font)) w.font = e.fonts.includes("Arial") ? "Arial" : (e.fonts[0] ?? "Arial");
+}
+
+export function togglePanel(p: "wm" | "hf") {
+  if (e.editing) return;
+  e.panel = e.panel === p ? null : p;
+  if (e.panel) {
+    e.sigOpen = false;
+    initSpots();
+  }
+}
+
+export async function loadDocObjs() {
+  clearTimeout(wmT);
+  wmT = 0;
+  for (const k of HF_POS) clearTimeout(hfT[k]);
+  let d: DocObjs;
+  try {
+    d = await editDocObjs();
+  } catch {
+    return; // ponytail: the forms keep their values if the backend cannot list them
+  }
+  const w = d.watermarks[0];
+  Object.assign(
+    e.wm,
+    newWm(),
+    w
+      ? {
+          id: w.id, kind: w.kind, text: w.text ?? "",
+          ...(w.style ? { font: w.style.font, bold: w.style.bold, italic: w.style.italic, color: w.style.color, auto: w.style.size <= 0, size: w.style.size > 0 ? w.style.size : 96 } : {}),
+          scale: w.scale ?? 50, opacity: Math.round(w.opacity * 100), angle: w.angle, layer: w.layer, allPages: !w.pages.trim(), ranges: w.pages, asset: w.asset ?? null,
+        }
+      : {},
+  );
+  const pos = e.hf.pos;
+  e.hf = newHf();
+  e.hf.pos = pos;
+  for (const r of d.header_footers) {
+    const s = e.hf.spots[r.pos];
+    if (s.id !== null) s.dup = true;
+    else Object.assign(s, { id: r.id, preset: presetOf(r.template), template: r.template, font: r.style.font, size: r.style.size, color: r.style.color, bold: r.style.bold, italic: r.style.italic, margin: r.margin_pt, start: r.start, skip: r.skip_first, allPages: !r.pages.trim(), ranges: r.pages });
+  }
+  initSpots();
+}
+
+// Runs one doc-wide command; the caller has checked e.busy. Re-renders every page when the backend says "all".
+async function docCall(call: () => Promise<DocRes>, ok: (id: number) => void, fail: (m: string) => void) {
+  e.busy = true;
+  e.objError = "";
+  try {
+    const r = await call();
+    if (r.kind === "ok") {
+      ok(r.id);
+      fail("");
+      e.dirty = true;
+      if (r.changed === "all") e.allGen++;
+      await refreshHistory();
+    } else fail(r.kind === "bad_pages" ? badPages(r.reason) : r.kind === "too_long" ? t("hfTooLong") : r.kind === "bad_text" ? t("wmEmpty") : t("editUnsupported", { c: r.chars }));
+  } catch (err) {
+    fail(String(err));
+  } finally {
+    e.busy = false;
+  }
+}
+const busyNow = () => e.busy || !!e.editing?.applying;
+
+export function wmChanged() {
+  clearTimeout(wmT);
+  wmT = setTimeout(runWm, 300);
+}
+async function runWm() {
+  wmT = 0;
+  if (busyNow()) return void (wmT = setTimeout(runWm, 100));
+  const w = e.wm;
+  const pages = pagesWire(w.allPages, w.ranges);
+  if (pages === null || (w.kind === "text" ? !w.text.trim() : !w.asset)) return; // nothing valid to preview yet
+  const style: Style = { font: w.font, size: w.auto ? 0 : w.size, color: w.color, bold: w.bold, italic: w.italic, align: "center" };
+  const req: WmReq = { id: w.id, kind: w.kind, ...(w.kind === "text" ? { text: w.text, style } : { asset: w.asset!, scale: w.scale }), opacity: w.opacity / 100, angle: w.angle, layer: w.layer, pages };
+  await docCall(() => editWatermark(req), (id) => (w.id = id), (m) => (w.err = m));
+}
+async function deleteDoc(id: number) {
+  e.busy = true;
+  try {
+    await editDeleteDocObj(id);
+    e.dirty = true;
+    e.allGen++;
+    await refreshHistory();
+  } catch (err) {
+    e.objError = String(err);
+  } finally {
+    e.busy = false;
+  }
+}
+export async function removeWm() {
+  clearTimeout(wmT);
+  wmT = 0;
+  if (e.busy) return;
+  if (e.wm.id !== null) await deleteDoc(e.wm.id);
+  Object.assign(e.wm, newWm());
+  initSpots();
+}
+
+export function hfChanged(pos: HfPos) {
+  clearTimeout(hfT[pos]);
+  hfT[pos] = setTimeout(() => void runHf(pos), 300);
+}
+async function runHf(pos: HfPos) {
+  if (busyNow()) return void (hfT[pos] = setTimeout(() => void runHf(pos), 100));
+  const s = e.hf.spots[pos];
+  const pages = pagesWire(s.allPages, s.ranges);
+  if (pages === null || !s.template.trim()) return;
+  const num = (v: number, lo: number, hi: number, d: number) => (Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d);
+  const style: Style = { font: s.font, size: s.size, color: s.color, bold: s.bold, italic: s.italic, align: pos[1] === "l" ? "left" : pos[1] === "c" ? "center" : "right" };
+  const req: HfReq = { id: s.id, pos, template: s.template, style, margin_pt: num(s.margin, 0, 300, 28), start: Math.round(num(s.start, 0, 99999, 1)), skip_first: s.skip, pages, lang: lang(), tz_min: -new Date().getTimezoneOffset() };
+  await docCall(() => editHeaderFooter(req), (id) => (s.id = id), (m) => (s.err = m));
+}
+export async function clearHf(pos: HfPos) {
+  const s = e.hf.spots[pos];
+  clearTimeout(hfT[pos]);
+  if (e.busy) return;
+  if (s.id !== null) await deleteDoc(s.id);
+  Object.assign(s, newSpot(), hfBase());
 }

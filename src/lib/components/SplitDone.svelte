@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { settings, type SplitResult } from "../state.svelte";
+  import { settings, goHome, type SplitResult } from "../state.svelte";
   import { t } from "../i18n";
   import { fmtNum } from "../format";
   import { revealPath } from "../tauri";
@@ -29,10 +29,11 @@
       <span style="width:48px;height:48px;border-radius:50%;background:var(--ok-soft);color:var(--ok);display:grid;place-items:center;flex-shrink:0">
         <i class="ph ph-check" style="font-size:26px"></i>
       </span>
-      <div>
+      <div style="flex:1;min-width:0">
         <div style="font-size:24px;font-weight:700">{t("splitDoneTitle", { n: fmtNum(result.outputs.length) })}</div>
         <div style="color:var(--text2)">{t("doneSubSplit")}</div>
       </div>
+      <button onclick={goHome} style="align-self:flex-start;width:40px;height:40px;flex-shrink:0;border:0;border-radius:10px;background:none;color:var(--accent-text);cursor:pointer;display:grid;place-items:center" aria-label={t("allTools")} title={t("allTools")}><i class="ph ph-house" style="font-size:22px"></i></button>
     </div>
 
     <ul style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px">

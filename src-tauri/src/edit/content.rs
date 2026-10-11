@@ -140,6 +140,116 @@ fn lex_hex(b: &[u8], mut i: usize) -> (Vec<u8>, usize) {
     (v, i)
 }
 
+const KNOWN_OPS: &[&str] = &[
+    "q", "Q", "cm", "w", "J", "j", "M", "d", "ri", "i", "gs", "m", "l", "c", "v", "y", "h", "re", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*", "BT", "ET", "Tc", "Tw", "Tz", "TL", "Tf", "Tr", "Ts", "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\"", "d0", "d1", "CS", "cs", "SC", "SCN", "sc", "scn", "G", "g", "RG", "rg", "K", "k", "sh", "BI", "Do", "MP", "DP", "BMC", "BDC", "EMC", "BX", "EX",
+];
+
+/// Index after the EI of an inline image whose "BI" ends at `i`. With a known size and no filter the data length is computed;
+/// otherwise the first whitespace + EI that is followed by something that lexes as the next token ends it.
+fn inline_end(b: &[u8], mut i: usize) -> usize {
+    let tok = |i: &mut usize| -> Option<(usize, usize)> {
+        while *i < b.len() && is_ws(b[*i]) {
+            *i += 1;
+        }
+        if *i >= b.len() {
+            return None;
+        }
+        let s = *i;
+        if is_delim(b[s]) {
+            *i += 1;
+            if b[s] == b'/' {
+                while *i < b.len() && !is_ws(b[*i]) && !is_delim(b[*i]) {
+                    *i += 1;
+                }
+            }
+        } else {
+            while *i < b.len() && !is_ws(b[*i]) && !is_delim(b[*i]) {
+                *i += 1;
+            }
+        }
+        Some((s, *i))
+    };
+    let (mut w, mut h, mut bpc, mut comps, mut filter, mut mask) = (None::<f64>, None::<f64>, None::<f64>, None::<f64>, false, false);
+    let mut key: Option<String> = None;
+    let mut data = None;
+    while let Some((s, e)) = tok(&mut i) {
+        let t = String::from_utf8_lossy(&b[s..e]).to_string();
+        if t == "ID" && key.is_none() {
+            data = Some((i + 1).min(b.len())); // one white-space byte follows ID
+            break;
+        }
+        match key.take() {
+            None => {
+                if let Some(k) = t.strip_prefix('/') {
+                    key = Some(k.to_string());
+                }
+            }
+            Some(k) => {
+                let v = t.trim_start_matches('/');
+                match k.as_str() {
+                    "W" | "Width" => w = v.parse().ok(),
+                    "H" | "Height" => h = v.parse().ok(),
+                    "BPC" | "BitsPerComponent" => bpc = v.parse().ok(),
+                    "IM" | "ImageMask" => mask = v == "true",
+                    "F" | "Filter" => filter = true,
+                    "CS" | "ColorSpace" => comps = match v { "G" | "DeviceGray" | "CalGray" | "I" | "Indexed" => Some(1.0), "RGB" | "DeviceRGB" | "CalRGB" => Some(3.0), "CMYK" | "DeviceCMYK" => Some(4.0), _ => None },
+                    _ => {}
+                }
+                if t.starts_with('[') {
+                    // an array value (e.g. /F [..] or an Indexed colour space): skip it
+                    filter |= k == "F" || k == "Filter";
+                    if k == "CS" || k == "ColorSpace" {
+                        comps = Some(1.0);
+                    }
+                    while let Some((s2, e2)) = tok(&mut i) {
+                        if &b[s2..e2] == b"]" {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let Some(start) = data else { return b.len() };
+    let after_ei = |p: usize| -> Option<usize> {
+        let mut q = p;
+        while q < b.len() && is_ws(b[q]) {
+            q += 1;
+        }
+        (b.get(q..q + 2) == Some(b"EI") && b.get(q + 2).is_none_or(|c| is_ws(*c) || is_delim(*c))).then_some(q + 2)
+    };
+    if mask {
+        bpc = Some(1.0);
+        comps = Some(1.0);
+    }
+    if let (false, Some(w), Some(h), Some(bpc), Some(c)) = (filter, w, h, bpc, comps) {
+        let len = ((w * c * bpc / 8.0).ceil() * h) as usize;
+        if let Some(e) = after_ei(start + len) {
+            return e;
+        }
+    }
+    let mut j = start;
+    while j + 2 < b.len() + 1 {
+        if j + 2 <= b.len() && (j == start || is_ws(b[j - 1])) && &b[j..(j + 2).min(b.len())] == b"EI" && b.get(j + 2).is_none_or(|c| is_ws(*c) || is_delim(*c)) {
+            // the next token must be an operator we know, or the start of an operand
+            let mut k = j + 2;
+            let next = tok(&mut k).map(|(s, e)| &b[s..e]);
+            let ok = match next {
+                None => true,
+                Some(t) => {
+                    let c = t[0];
+                    c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'/' | b'[' | b'(' | b'<') || std::str::from_utf8(t).is_ok_and(|x| KNOWN_OPS.contains(&x))
+                }
+            };
+            if ok {
+                return j + 2;
+            }
+        }
+        j += 1;
+    }
+    b.len()
+}
+
 fn lex(b: &[u8]) -> Vec<T> {
     let mut v = vec![];
     let mut i = 0;
@@ -241,19 +351,8 @@ fn lex(b: &[u8]) -> Vec<T> {
                 if let Ok(n) = w.parse::<f64>() {
                     v.push(T { k: K::Num(n), s, e: i });
                 } else if w == "BI" {
-                    // inline image: skip to "EI" and keep it as one op
-                    let mut j = i;
-                    loop {
-                        if j + 2 >= b.len() {
-                            j = b.len();
-                            break;
-                        }
-                        if is_ws(b[j]) && b[j + 1] == b'E' && b[j + 2] == b'I' && (j + 3 >= b.len() || is_ws(b[j + 3])) {
-                            j += 3;
-                            break;
-                        }
-                        j += 1;
-                    }
+                    // inline image: the dictionary up to ID, then the data, then EI; kept as one op
+                    let j = inline_end(b, i);
                     i = j;
                     v.push(T { k: K::Op("BI".into()), s, e: i });
                 } else if matches!(w, "true" | "false" | "null") {
@@ -959,6 +1058,21 @@ pub fn text_restore(an: &Analysis, after: Option<usize>) -> String {
         let _ = writeln!(s, "[{}] TJ", fmt(-adv * 1000.0 / (gs.fs * gs.th)));
     }
     s
+}
+
+/// Last token of an op's text: its operator name ("re", "S", "Do"; "BI" for an inline image).
+pub fn op_name<'a>(joined: &'a [u8], o: &Op) -> &'a str {
+    let b = &joined[o.s..o.e];
+    if b.len() > 2 && b.starts_with(b"BI") && is_ws(b[2]) {
+        return "BI";
+    }
+    let t = b.iter().rposition(|c| is_ws(*c) || is_delim(*c)).map(|p| p + 1).unwrap_or(0);
+    std::str::from_utf8(&b[t..]).unwrap_or("")
+}
+
+/// Matrix X with X x ctm = ctm x a: `q X cm` before an object drawn under `ctm` applies the analysis-frame transform `a` to it.
+pub fn conj(ctm: M, a: M) -> Option<M> {
+    Some(mul(mul(ctm, a), inv(ctm)?))
 }
 
 /// `q 1 0 0 1 tx ty cm` that moves everything after it down by `dy` page points, whatever the CTM there is.

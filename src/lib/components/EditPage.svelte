@@ -2,7 +2,7 @@
   import { onMount, tick, untrack } from "svelte";
   import { app } from "../state.svelte";
   import { t } from "../i18n";
-  import { editPage, editRender, openEditor, closeEditor, applyEditor, usePcFont, selectObj, clearSel, moveObj, addWhiteout, coverOnly, dismissWo, startBox, openBoxEditor, placeArmed, selChanged, type Para, type Obj, type Rect, type Style } from "../edit";
+  import { editPage, editRender, openEditor, closeEditor, applyEditor, usePcFont, selectObj, clearSel, moveObj, addWhiteout, coverOnly, dismissWo, startBox, openBoxEditor, placeArmed, selChanged, setTool, selectItems, toggleItem, isSelItem, moveItems, resizeItem, type Item, type Para, type Obj, type Rect, type Style } from "../edit";
   import { renderRuns, readRuns, offsetOf, setSel, textOf } from "../rich";
 
   // One page: lazy-rendered image, paragraph overlay and (when open here) the in-place editor. All text is plain; never {@html}.
@@ -275,7 +275,7 @@
   // ---- page-level pointer: white-out drag, add-text click, armed signature placement, deselect ----
   let wo = $state<Rect | null>(null);
   let woFrom: [number, number] | null = null;
-  const at = (ev: PointerEvent): [number, number] => {
+  const at = (ev: MouseEvent): [number, number] => {
     const r = host.getBoundingClientRect();
     return [Math.max(0, Math.min((ev.clientX - r.left) / scale, size[0])), Math.max(0, Math.min((ev.clientY - r.top) / scale, size[1]))];
   };
@@ -283,6 +283,7 @@
     const tg = ev.target as Element;
     if (ev.button !== 0 || (tg !== host && tg.tagName !== "IMG")) return;
     const p = at(ev);
+    if (e.tool === "select") return void selectDown(ev, p);
     clearSel();
     if (e.tool === "wo") {
       if (e.editing || e.busy) return;
@@ -293,19 +294,144 @@
     else if (e.tool === "sig" && e.armed) void placeArmed(i, p[0], p[1]);
   }
   function hostmove(ev: PointerEvent) {
+    if (e.tool === "select") return void selectMove(ev);
     if (!woFrom) return;
     const p = at(ev);
     wo = [Math.min(woFrom[0], p[0]), Math.min(woFrom[1], p[1]), Math.abs(p[0] - woFrom[0]), Math.abs(p[1] - woFrom[1])];
   }
   function hostup() {
+    if (e.tool === "select") return void selectUp();
     const r = wo;
     wo = null;
     woFrom = null;
     if (r && r[2] >= 4 && r[3] >= 4) void addWhiteout(i, r);
   }
+  // ---- Select tool: existing paragraphs, images, lines & shapes ----
+  type IDrag = { mode: string; sx: number; sy: number; dx: number; dy: number; moved: boolean; u: Rect; r0: Rect; r: Rect; item: Item | null; collapse: Item | null };
+  let hov = $state<Item | null>(null);
+  let idrag = $state<IDrag | null>(null);
+  let mq = $state<Rect | null>(null);
+  let mqFrom: [number, number] | null = null;
+  let mqShift = false;
+  let lk = $state({ x: 0, y: 0 });
+  let lkEl = $state<HTMLDivElement>();
+  let lkPos = $state({ left: 0, top: 0 });
+  const selHere = $derived(e.tool === "select" && e.isel?.page === i ? (model?.items ?? []).filter((it) => isSelItem(i, it)) : []);
+  const oneImg = $derived(selHere.length === 1 && selHere[0].kind === "image" && !selHere[0].locked ? selHere[0] : null);
+  const PX3 = 3; // px: lines and shapes are thin, so their outline and hit area are inflated by this much
+
+  // Topmost (last in z) item under the point; a paragraph wins over lines and shapes, so table borders never steal cell clicks.
+  function hitTest(p: [number, number]): Item | null {
+    const tol = PX3 / scale;
+    const hits = (model?.items ?? []).filter((it) => {
+      const pad = it.kind === "path" ? tol : 0;
+      return p[0] >= it.bbox[0] - pad && p[0] <= it.bbox[0] + it.bbox[2] + pad && p[1] >= it.bbox[1] - pad && p[1] <= it.bbox[1] + it.bbox[3] + pad;
+    });
+    const rest = hits.some((it) => it.kind === "para") ? hits.filter((it) => it.kind !== "path") : hits;
+    return rest[rest.length - 1] ?? null;
+  }
+  function selectDown(ev: PointerEvent, p: [number, number]) {
+    if (e.editing || e.busy) return;
+    hov = null; // a stale hover would keep the pre-move outline
+    const hit = hitTest(p);
+    if (hit && !hit.locked) {
+      host.setPointerCapture(ev.pointerId);
+      let collapse: Item | null = null;
+      if ((ev.shiftKey || ev.ctrlKey || ev.metaKey)) toggleItem(i, hit);
+      else if (isSelItem(i, hit)) collapse = hit;
+      else selectItems(i, [hit]);
+      if (!isSelItem(i, hit)) return; // shift removed it: nothing to drag
+      const sel = (model?.items ?? []).filter((it) => isSelItem(i, it));
+      const x1 = Math.min(...sel.map((it) => it.bbox[0]));
+      const y1 = Math.min(...sel.map((it) => it.bbox[1]));
+      const x2 = Math.max(...sel.map((it) => it.bbox[0] + it.bbox[2]));
+      const y2 = Math.max(...sel.map((it) => it.bbox[1] + it.bbox[3]));
+      idrag = { mode: "move", sx: ev.clientX, sy: ev.clientY, dx: 0, dy: 0, moved: false, u: [x1, y1, x2, y2], r0: [x1, y1, x2 - x1, y2 - y1], r: [x1, y1, x2 - x1, y2 - y1], item: null, collapse };
+      return;
+    }
+    if (!(ev.shiftKey || ev.ctrlKey || ev.metaKey)) selectItems(i, []);
+    if (hit) return; // locked: nothing to do
+    host.setPointerCapture(ev.pointerId);
+    mqFrom = p;
+    mqShift = ev.shiftKey || ev.ctrlKey || ev.metaKey;
+    mq = [p[0], p[1], 0, 0];
+  }
+  function hdown(ev: PointerEvent, it: Item, mode: string) {
+    if (ev.button !== 0 || e.busy) return;
+    ev.stopPropagation();
+    (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+    idrag = { mode, sx: ev.clientX, sy: ev.clientY, dx: 0, dy: 0, moved: false, u: [0, 0, 0, 0], r0: [...it.bbox], r: [...it.bbox], item: it, collapse: null };
+  }
+  function selectMove(ev: PointerEvent) {
+    const d = idrag;
+    if (d) {
+      const dx = (ev.clientX - d.sx) / scale;
+      const dy = (ev.clientY - d.sy) / scale;
+      if (!d.moved && Math.hypot(dx, dy) * scale < 3) return;
+      d.moved = true;
+      if (d.mode === "move") {
+        d.dx = Math.max(-d.u[0], Math.min(dx, size[0] - d.u[2]));
+        d.dy = Math.max(-d.u[1], Math.min(dy, size[1] - d.u[3]));
+      } else d.r = resized(d.r0, d.mode, dx, dy, { kind: "image", rot: 0 } as Obj, !ev.shiftKey);
+      return;
+    }
+    const p = at(ev);
+    if (mqFrom) {
+      mq = [Math.min(mqFrom[0], p[0]), Math.min(mqFrom[1], p[1]), Math.abs(p[0] - mqFrom[0]), Math.abs(p[1] - mqFrom[1])];
+      return;
+    }
+    hov = (ev.target as Element).closest?.(".obj") ? null : hitTest(p);
+    lk = { x: ev.clientX, y: ev.clientY };
+  }
+  function selectUp() {
+    const d = idrag;
+    idrag = null;
+    if (d) {
+      if (d.moved) void (d.mode === "move" ? moveItems(d.dx, d.dy) : resizeItem(i, d.item!, d.r));
+      else if (d.collapse) selectItems(i, [d.collapse]);
+      return;
+    }
+    const r = mq;
+    mq = null;
+    mqFrom = null;
+    if (!r || r[2] < 3 || r[3] < 3) return;
+    const inside = (model?.items ?? []).filter((it) => !it.locked && it.bbox[0] >= r[0] && it.bbox[1] >= r[1] && it.bbox[0] + it.bbox[2] <= r[0] + r[2] && it.bbox[1] + it.bbox[3] <= r[1] + r[3]);
+    const keep = mqShift && e.isel?.page === i ? e.isel.items : [];
+    selectItems(i, [...keep, ...inside.filter((it) => !keep.some((k) => k.kind === it.kind && k.id === it.id))]);
+  }
+  // Double-click a paragraph in the Select tool: switch to Edit text and open it.
+  function hostdbl(ev: MouseEvent) {
+    if (e.tool !== "select" || e.editing || (ev.target as Element).closest?.(".obj")) return;
+    const it = hitTest(at(ev));
+    const para = it?.kind === "para" && !it.locked ? model?.paras.find((x) => x.id === it.id) : undefined;
+    if (!para || (para.status !== "direct" && para.status !== "pc_font")) return;
+    setTool("text");
+    openEditor(i, para.id, para.status === "pc_font");
+  }
+  const olBox = (b: Rect, kind: string, ox = 0, oy = 0) => {
+    const pad = kind === "path" ? PX3 : 0;
+    return `left:${(b[0] + ox) * scale - pad}px;top:${(b[1] + oy) * scale - pad}px;width:${b[2] * scale + 2 * pad}px;height:${b[3] * scale + 2 * pad}px`;
+  };
+  $effect(() => {
+    // lock tooltip: beside the pointer, flipped and clamped so it is never clipped
+    lk;
+    if (!lkEl) return;
+    const w = lkEl.offsetWidth;
+    const h = lkEl.offsetHeight;
+    lkPos = { left: Math.max(8, Math.min(lk.x + 14, innerWidth - w - 8)), top: lk.y + 20 + h > innerHeight - 8 ? Math.max(8, lk.y - 14 - h) : lk.y + 20 };
+  });
+  $effect(() => {
+    if (e.tool !== "select") {
+      hov = null;
+      idrag = null;
+      mq = null;
+      mqFrom = null;
+    }
+  });
+
   // Add text and an armed signature place on a click: white-outs and images let it through.
   const through = $derived(e.tool === "add" || (e.tool === "sig" && !!e.armed));
-  const cursor = $derived(e.tool === "wo" || e.tool === "add" || (e.tool === "sig" && e.armed) ? "crosshair" : "default");
+  const cursor = $derived(e.tool === "select" ? (mq ? "crosshair" : idrag?.mode === "move" ? "grabbing" : hov ? (hov.locked ? "not-allowed" : "move") : "default") : e.tool === "wo" || e.tool === "add" || (e.tool === "sig" && e.armed) ? "crosshair" : "default");
 
   function onkeydown(ev: KeyboardEvent) {
     if (ev.key === "Escape") {
@@ -352,12 +478,14 @@
   onpointermove={hostmove}
   onpointerup={hostup}
   onpointercancel={hostup}
+  onpointerleave={() => (hov = null)}
+  ondblclick={hostdbl}
   style="cursor:{cursor};position:relative;flex-shrink:0;margin-inline:auto;width:{dispW}px;height:{dispH}px;background:var(--page);box-shadow:0 0 0 1px var(--pageedge),var(--shadow)"
 >
   {#if img}<img src={img} alt="" draggable="false" style="position:absolute;inset:0;width:100%;height:100%;display:block;user-select:none" />{/if}
 
   <div class="paras" class:off={e.tool !== "text"}>
-  {#each model?.paras ?? [] as p (p.id)}
+  {#each (model?.paras ?? []).filter((x) => !x.removed) as p (p.id)}
     {@const box = `left:${p.bbox[0] * scale}px;top:${p.bbox[1] * scale}px;width:${p.bbox[2] * scale}px;height:${p.bbox[3] * scale}px`}
     {@const tip = `${tipUp(p) ? "bottom:100%" : "top:100%"};${tipRight(p) ? "right:0" : "left:0"}`}
     {#if p.status === "direct"}
@@ -416,6 +544,39 @@
       {/if}
     </div>
   {/each}
+
+  {#if e.tool === "select"}
+    <div class="items" aria-hidden="true">
+      {#if hov && !idrag && !isSelItem(i, hov)}<div class="ol hov" class:lk={!!hov.locked} style={olBox(hov.bbox, hov.kind)}></div>{/if}
+      {#each selHere as it (it.kind + ":" + it.id)}
+        {@const resizing = !!idrag?.item && idrag.item.id === it.id && idrag.item.kind === it.kind}
+        {@const mv = idrag?.mode === "move"}
+        <div class="ol sel" style={resizing ? olBox(idrag!.r, it.kind) : olBox(it.bbox, it.kind, mv ? idrag!.dx : 0, mv ? idrag!.dy : 0)}>
+          {#if oneImg && it === oneImg && !ed}
+            {#each HANDLES as h (h)}
+              <span
+                class="handle"
+                aria-hidden="true"
+                style="cursor:{CURSOR[h]};left:{h.includes('w') ? '-7px' : h.includes('e') ? 'calc(100% - 7px)' : 'calc(50% - 7px)'};top:{h.includes('n') ? '-7px' : h.includes('s') ? 'calc(100% - 7px)' : 'calc(50% - 7px)'}"
+                onpointerdown={(ev) => hdown(ev, it, h)}
+              ></span>
+            {/each}
+          {/if}
+        </div>
+      {/each}
+      {#if mq}<div class="ol mq" style="left:{mq[0] * scale}px;top:{mq[1] * scale}px;width:{mq[2] * scale}px;height:{mq[3] * scale}px"></div>{/if}
+    </div>
+  {/if}
+
+  {#if e.tool === "select" && hov?.locked && !idrag}
+    <div
+      bind:this={lkEl}
+      role="tooltip"
+      style="position:fixed;z-index:30;pointer-events:none;left:{lkPos.left}px;top:{lkPos.top}px;box-sizing:border-box;width:max-content;max-width:min(300px,calc(100vw - 16px));display:flex;gap:8px;align-items:flex-start;padding:6px 10px;border-radius:8px;background:var(--surface);color:var(--text);border:1px solid var(--line2);font-size:13.5px;line-height:1.35;box-shadow:var(--shadow)"
+    >
+      <i class="ph ph-lock-simple" style="font-size:16px;margin-top:1px;flex-shrink:0"></i>{t("editLockedItem")}
+    </div>
+  {/if}
 
   {#if wo}
     <div style="position:absolute;z-index:3;pointer-events:none;box-sizing:border-box;left:{wo[0] * scale}px;top:{wo[1] * scale}px;width:{wo[2] * scale}px;height:{wo[3] * scale}px;background:#fff;border:1.5px dashed #444"></div>
@@ -545,6 +706,35 @@
   .obj.sel {
     outline: 2px solid var(--accent);
     outline-offset: 0;
+  }
+  .items {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    pointer-events: none;
+  }
+  .ol {
+    position: absolute;
+    box-sizing: border-box;
+    border-radius: 1px;
+  }
+  .ol.hov {
+    outline: 1.5px dashed var(--accent);
+    outline-offset: 1px;
+  }
+  .ol.hov.lk {
+    outline-color: var(--text3);
+  }
+  .ol.sel {
+    outline: 2px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .ol.mq {
+    border: 1.5px dashed var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .items .handle {
+    pointer-events: auto;
   }
   .obj.hide {
     visibility: hidden;

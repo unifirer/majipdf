@@ -1,5 +1,5 @@
 import { clearThumbCache } from "./thumbcache";
-import type { EditDoc, EditHistory, EditSaveRes, PageModel, Style, Run, ObjReq, SigItem } from "./edit";
+import type { EditDoc, EditHistory, EditSaveRes, PageModel, Style, Run, ObjReq, SigItem, ItemRef, HfPos } from "./edit";
 
 export const isMac = /Mac/.test(navigator.userAgent);
 
@@ -140,7 +140,48 @@ export interface OcrResult {
 }
 
 // Edit PDF: the open in-place editor (contract types live in edit.ts)
-export type EditTool = "text" | "add" | "wo" | "sig";
+export type EditTool = "select" | "text" | "add" | "wo" | "sig";
+// Edit 3 panels (document-wide): watermark and header & footer forms. Live preview: edit.ts applies 300 ms after a change.
+export interface WmForm {
+  id: number | null; // backend id once applied
+  kind: "text" | "image";
+  text: string;
+  font: string;
+  bold: boolean;
+  italic: boolean;
+  color: string;
+  auto: boolean; // text size fits the page (size 0 on the wire)
+  size: number; // manual pt
+  scale: number; // image: % of page width
+  opacity: number; // percent
+  angle: number;
+  layer: "behind" | "front";
+  allPages: boolean;
+  ranges: string;
+  asset: string | null;
+  err: string;
+}
+export interface HfSpot {
+  id: number | null;
+  preset: string; // "custom" or a preset template
+  template: string;
+  font: string;
+  size: number;
+  color: string;
+  bold: boolean;
+  italic: boolean;
+  margin: number;
+  start: number;
+  skip: boolean;
+  allPages: boolean;
+  ranges: string;
+  dup: boolean; // the document holds two items at this position
+  err: string;
+}
+export const newWm = (): WmForm => ({ id: null, kind: "text", text: "", font: "Arial", bold: true, italic: false, color: "#808080", auto: true, size: 96, scale: 50, opacity: 30, angle: 45, layer: "behind", allPages: true, ranges: "", asset: null, err: "" });
+export const newSpot = (): HfSpot => ({ id: null, preset: "custom", template: "", font: "Arial", size: 9, color: "#000000", bold: false, italic: false, margin: 28, start: 1, skip: false, allPages: true, ranges: "", dup: false, err: "" });
+export const HF_POS: HfPos[] = ["tl", "tc", "tr", "bl", "bc", "br"];
+export const newHf = () => ({ pos: "bc" as HfPos, spots: Object.fromEntries(HF_POS.map((p) => [p, newSpot()])) as Record<HfPos, HfSpot> });
 // Format panel target: a paragraph whose editor is open, or a text box (selected or being edited)
 export interface Fmt {
   kind: "para" | "box";
@@ -335,6 +376,12 @@ export const app = $state({
     editing: null as Editing | null,
     tool: "text" as EditTool,
     sel: null as { page: number; id: number } | null, // selected placed object
+    isel: null as { page: number; items: ItemRef[] } | null, // Select tool: selected existing items (one page)
+    scanNote: false, // dismissible scan notice over the editor
+    scanShown: false, // shown once per session
+    panel: null as null | "wm" | "hf", // document-wide panel replacing the editing panel body
+    wm: newWm(),
+    hf: newHf(),
     fmt: null as Fmt | null,
     armed: null as SigItem | null, // library item waiting to be placed
     sigs: [] as SigItem[],

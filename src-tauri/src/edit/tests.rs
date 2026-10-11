@@ -1399,3 +1399,7 @@ fn e2_textbox_runs() {
         assert!(matches!(s.apply_obj(&r2).unwrap(), ObjRes::Ok { .. }));
     }
 }
+
+#[cfg(test)]
+#[path = "tests3.rs"]
+mod tests3;

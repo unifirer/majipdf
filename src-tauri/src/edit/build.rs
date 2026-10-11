@@ -1,7 +1,8 @@
 //! Per-page build: paragraph edits (neutralise, retype, push), white-outs (glyph and pixel removal, cover), text boxes and images,
 //! all as one rewritten original stream plus one appended stream in list (z) order. Contract: _docs/edit2-contract.md.
-use super::content::{self, expand_range, glyph_boxes, glyph_hit, inv, mul, restore_ops, rewrite, shift_open, splice, text_restore, Mod, M, OK};
+use super::content::{self, conj, expand_range, glyph_boxes, glyph_hit, inv, mul, restore_ops, rewrite, shift_open, splice, text_restore, tr, Mod, M, OK};
 use super::fonts::{deref, effective_resources, embed_pc, pc_fnt, Fnt, Kind};
+use super::docobj::DocAdd;
 use super::layout::{self, box_layout_items, emit, family, line_scales, retype_runs, retype_with, runs_from_words, typeset, Align, BoxItem, Restyle};
 use super::whiteout::{self, decode_images, new_image, open_smask, png_xobject, poly, rot_frame, src_of};
 use super::*;
@@ -21,6 +22,8 @@ pub(super) struct Acc {
     pub asset_objs: HashMap<String, (String, ObjectId)>,
     pub nimg: usize,
     pub prune: bool,
+    pub gs: BTreeMap<i64, (String, ObjectId)>, // transparency states by opacity (per mille), one object each
+    pub dims: HashMap<String, (u32, u32)>,     // pixel size of placed assets
 }
 
 struct Plan<'a> {
@@ -31,8 +34,10 @@ struct Plan<'a> {
     words: Vec<Vec<layout::Ch>>,
     lines: Vec<layout::LayLine>,
     dy: f64, // down, page points
-    edit: &'a Edit,
+    edit: Edit,
     scaled: bool, // line baselines were recomputed (mixed sizes)
+    off: (f64, f64), // moved by this much (analysis frame)
+    gone: bool,      // removed: the original is neutralised and nothing is written
 }
 
 struct Push {
@@ -114,12 +119,6 @@ fn overlaps(a: [f64; 4], b: [f64; 4]) -> bool {
     a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
 }
 
-fn do_name(joined: &[u8], o: &content::Op) -> Option<String> {
-    let t = String::from_utf8_lossy(&joined[o.s..o.e]).to_string();
-    let n = t.trim().strip_prefix('/')?;
-    Some(n.split_whitespace().next()?.to_string())
-}
-
 /// Display (y up) -> user space.
 fn d2u(pa: &PageAn) -> M {
     mul(inv(pa.to_disp).unwrap_or(content::ID), pa.rinv)
@@ -143,18 +142,36 @@ pub(super) fn count_chars(s: &str) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &Shared, acc: &mut Acc) -> Result<PageInfo, BErr> {
+pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &Shared, acc: &mut Acc, add: &DocAdd) -> Result<PageInfo, BErr> {
     let [_, oy, _, _] = pa.page;
-    // ---- paragraph plans
+    // ---- paragraph plans: edited paragraphs, plus moved or removed ones that have no edit of their own (their text unchanged)
     let mut plans: Vec<Plan> = vec![];
+    let mut cands: Vec<(usize, Edit, bool)> = vec![];
     for (ii, it) in items.iter().enumerate() {
-        let Item::Para(e) = it else { continue };
-        let para = pa.paras.get(e.para as usize).ok_or_else(|| BErr::Other("no such paragraph".into()))?;
-        if para.ed.is_none() {
-            return Err(BErr::Other("locked".into()));
+        match it {
+            Item::Para(e) => cands.push((ii, e.clone(), false)),
+            Item::Mv(m) if m.kind == IKind::Para && !items.iter().any(|x| matches!(x, Item::Para(e) if e.para == m.id)) => {
+                let para = pa.paras.get(m.id as usize).ok_or_else(|| BErr::Other("no such paragraph".into()))?;
+                // a pc_font paragraph can only be written again in a PC font
+                cands.push((ii, Edit { page: m.page, para: m.id, text: norm(&para.text), use_pc: para.pc_font, allow_overlap: false, style: None, runs: None }, true));
+            }
+            _ => {}
         }
+    }
+    for (ii, e, synth) in cands {
+        let para = pa.paras.get(e.para as usize).ok_or_else(|| BErr::Other("no such paragraph".into()))?;
+        let Some(pe) = para.ed.as_ref() else { return Err(BErr::Other("locked".into())) };
+        let mv = items.iter().find_map(|x| match x {
+            Item::Mv(m) if m.kind == IKind::Para && m.id == e.para => Some(m),
+            _ => None,
+        });
+        if mv.is_some_and(|m| m.removed) {
+            plans.push(Plan { item: ii, para, ed: pe.clone(), styles: pe.styles.clone(), words: vec![], lines: vec![], dy: 0.0, edit: e, scaled: false, off: (0.0, 0.0), gone: true });
+            continue;
+        }
+        let off = mv.map(|m| disp_delta_to_work(pa, m.dx, m.dy)).unwrap_or((0.0, 0.0));
         let (styles, words, mut ed) = if let Some(runs) = &e.runs {
-            let mut ed = para.ed.clone().unwrap();
+            let mut ed = pe.clone();
             let ro = retype_runs(&ed, para.pc_font, &pa.fonts, sh.used, runs, &mut acc.pcs, e.use_pc).map_err(fail)?;
             if ro.width_changed {
                 ed.line_words.clear();
@@ -174,11 +191,16 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             if para.pc_font && !use_pc {
                 return Err(BErr::Missing(e.text.chars().filter(|c| !c.is_whitespace()).collect()));
             }
-            let (styles, words) = retype_with(&ed, &pa.fonts, sh.used, &e.text, if use_pc || para.pc_font { Some(&mut acc.pcs) } else { None }, &rs).map_err(fail)?;
+            let (styles, words) = match retype_with(&ed, &pa.fonts, sh.used, &e.text, if use_pc || para.pc_font { Some(&mut acc.pcs) } else { None }, &rs) {
+                Ok(x) => x,
+                // a moved paragraph that can't be written again can't be moved on its own
+                Err(_) if synth => return Err(BErr::CannotMove(pa.idx, IKind::Para, para.id)),
+                Err(f) => return Err(fail(f)),
+            };
             (styles, words, ed)
         };
         let lines = if words.is_empty() { vec![] } else { typeset(&ed, &styles, &words) };
-        let old_h = para.ed.as_ref().unwrap().nlines as f64 * para.ed.as_ref().unwrap().pitch;
+        let old_h = pe.nlines as f64 * pe.pitch;
         let mut new_h = lines.len() as f64 * ed.pitch;
         let mut scaled = false;
         if e.runs.is_some() && !lines.is_empty() {
@@ -196,8 +218,9 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
                 scaled = true;
             }
         }
-        let dy = new_h - old_h;
-        plans.push(Plan { item: ii, para, ed, styles, words, lines, dy, edit: e, scaled });
+        // a plain move pushes nothing
+        let dy = if synth { 0.0 } else { new_h - old_h };
+        plans.push(Plan { item: ii, para, ed, styles, words, lines, dy, edit: e, scaled, off, gone: false });
     }
     let neut: HashSet<usize> = plans.iter().flat_map(|p| p.para.ed.as_ref().unwrap().shows.iter().map(|&s| pa.an.shows[s].op)).collect();
     // ---- pushes
@@ -271,6 +294,12 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
     let mut info = PageInfo { shift: pa.paras.iter().map(|p| shift_of(&pushes, p.top, p.id)).collect(), ..Default::default() };
     for p in &plans {
         info.lines.insert(p.para.id, p.lines.len());
+        if p.gone {
+            info.gone.insert(p.para.id);
+        }
+        if p.off != (0.0, 0.0) {
+            info.off.insert(p.para.id, p.off);
+        }
         if !p.lines.is_empty() {
             info.ext.insert(p.para.id, layout::extent(&p.styles, &p.words, &p.lines));
         }
@@ -306,6 +335,9 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
     }
     // ---- white-outs on the original content (glyphs, image pixels); evaluated where the content is and where a push put it
     let tot_shift = |op: usize| -> f64 { pushes.iter().filter(|x| x.moving.contains(&op)).map(|x| x.dy).sum() };
+    let mvs: Vec<&MvE> = items.iter().filter_map(|x| if let Item::Mv(m) = x { (m.kind != IKind::Para).then_some(m) } else { None }).collect();
+    let find_item = |m: &MvE| pa.items.iter().find(|x| x.kind == m.kind && x.id == m.id);
+    let gone_ops: HashSet<usize> = mvs.iter().filter(|m| m.removed).filter_map(|m| find_item(m)).filter(|pi| pi.kind == IKind::Image && pi.op != usize::MAX).map(|pi| pi.op).collect();
     let wos: Vec<(usize, &ObjE)> = items.iter().enumerate().filter_map(|(i, it)| if let Item::Obj(o) = it { (o.kind == ObjKind::WhiteOut).then_some((i, o)) } else { None }).collect();
     let wrects: Vec<[f64; 4]> = wos.iter().map(|(_, o)| rect_work(pa, o.rect)).collect();
     let mut res_fonts: Vec<(String, ObjectId)> = vec![];
@@ -364,7 +396,7 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             Some((s.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) == Some(b"Image"), src_of(&s.dict)))
         };
         for (i, o) in ops.iter().enumerate() {
-            if o.k != OK::Do {
+            if o.k != OK::Do || gone_ops.contains(&i) {
                 continue;
             }
             let (Some(b), Some(name)) = (o.bbox, do_name(&pa.joined, o)) else { continue };
@@ -431,6 +463,76 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             }
         }
     }
+    // ---- moves, resizes and removals of images and paths (Edit 3)
+    let mut gone_names: Vec<String> = vec![];
+    for m in &mvs {
+        let Some(pi) = find_item(m) else { return Err(BErr::Other("no such item".into())) };
+        let cannot = || BErr::CannotMove(pa.idx, m.kind, m.id);
+        if pi.locked.is_some() || pi.op == usize::MAX {
+            return Err(cannot());
+        }
+        let o = &ops[pi.op];
+        if m.removed {
+            if pi.kind == IKind::Image {
+                mods.push(Mod { s: o.s, e: o.e, bytes: vec![], prio: 0 });
+                gone_names.extend(pi.name.clone());
+                acc.prune = true;
+            } else if pi.clip {
+                // the path also sets the clip: keep it, paint nothing
+                mods.push(Mod { s: o.s, e: o.e, bytes: b"n".to_vec(), prio: 0 });
+            } else {
+                mods.push(Mod { s: ops[pi.lo].s, e: o.e, bytes: vec![], prio: 0 });
+            }
+            continue;
+        }
+        let ctm = pa.an.snaps[o.snap as usize].ctm;
+        let cm = |x: M| format!("q {} {} {} {} {} {} cm\n", content::fmt(x[0]), content::fmt(x[1]), content::fmt(x[2]), content::fmt(x[3]), content::fmt(x[4]), content::fmt(x[5]));
+        if pi.kind == IKind::Image {
+            let Some(r) = m.rect else { continue };
+            // map the old box to the new one (the new box is where the image sits before any push)
+            let (nw, ob) = (rect_work(pa, r), pi.bbox);
+            let (sx, sy) = ((nw[2] - nw[0]) / (ob[2] - ob[0]).max(1e-6), (nw[3] - nw[1]) / (ob[3] - ob[1]).max(1e-6));
+            let x = conj(ctm, [sx, 0.0, 0.0, sy, nw[0] - sx * ob[0], nw[1] - sy * ob[1]]).ok_or_else(cannot)?;
+            if o.bt {
+                return Err(cannot());
+            }
+            // a white-out of this image already replaced the Do: wrap its result
+            let inner = match mods.iter().position(|x| x.s == o.s && x.e == o.e) {
+                Some(p) => mods.remove(p).bytes,
+                None => pa.joined[o.s..o.e].to_vec(),
+            };
+            let mut b = cm(x).into_bytes();
+            b.extend(inner);
+            b.extend(b"\nQ");
+            mods.push(Mod { s: o.s, e: o.e, bytes: b, prio: 0 });
+        } else {
+            let (dx, dy) = disp_delta_to_work(pa, m.dx, m.dy);
+            if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
+                continue;
+            }
+            // a clipping path or one inside a text object can't be wrapped without changing other content
+            if pi.clip || o.bt {
+                return Err(cannot());
+            }
+            let x = conj(ctm, tr(dx, dy)).ok_or_else(cannot)?;
+            mods.push(Mod { s: ops[pi.lo].s, e: ops[pi.lo].s, bytes: cm(x).into_bytes(), prio: -500 });
+            mods.push(Mod { s: o.e, e: o.e, bytes: b"\nQ\n".to_vec(), prio: -3000 });
+        }
+    }
+    for n in gone_names {
+        let still = ops.iter().enumerate().any(|(j, x)| x.k == OK::Do && !gone_ops.contains(&j) && do_name(&pa.joined, x).as_deref() == Some(n.as_str()));
+        if !still && !res_rm.contains(&n) {
+            res_rm.push(n);
+        }
+    }
+    for pi in &pa.items {
+        if pi.op != usize::MAX {
+            let t = tot_shift(pi.op);
+            if t != 0.0 {
+                info.ishift.insert((pi.kind, pi.id), t);
+            }
+        }
+    }
     // ---- appended content, in list (z) order
     let rmat = inv(pa.rinv).unwrap_or(content::ID);
     let l2u_page = d2u(pa);
@@ -438,15 +540,16 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
     let mut font_map: Option<BTreeMap<String, Fnt>> = None;
     for (ii, it) in items.iter().enumerate() {
         match it {
-            Item::Para(_) => {
+            Item::Para(_) | Item::Mv(_) => {
                 let Some(p) = plans.iter().find(|p| p.item == ii) else { continue };
                 if !p.lines.is_empty() {
                     let mut b = b"q\n0 Tc 100 Tz 0 Ts 0 Tr\n".to_vec();
-                    b.extend(emit(&p.ed, &p.styles, &p.words, &p.lines, shift_of(&pushes, p.ed.top, p.para.id), pa.rinv));
+                    b.extend(emit(&p.ed, &p.styles, &p.words, &p.lines, shift_of(&pushes, p.ed.top, p.para.id), mul(tr(p.off.0, p.off.1), pa.rinv)));
                     b.extend(b"Q\n");
                     segs.push((0, b));
                 }
             }
+            Item::Wm(_) | Item::Hf(_) => {}
             Item::Obj(o) => match o.kind {
                 ObjKind::TextBox => {
                     let (mut bytes, rect, names) = textbox_bytes(pa, o, sh, acc, l2u_page)?;
@@ -506,30 +609,11 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
         res_fonts.push((n, id));
     }
     let removed_names = res_rm;
-    if !res_fonts.is_empty() || !res_x.is_empty() || !removed_names.is_empty() {
-        let mut res = effective_resources(doc, pa.pid).cloned().unwrap_or_default();
-        if !res_fonts.is_empty() {
-            let mut fd = res.get(b"Font").ok().and_then(|o| deref(doc, o).as_dict().ok()).cloned().unwrap_or_default();
-            for (n, id) in res_fonts {
-                fd.set(n.as_bytes().to_vec(), Object::Reference(id));
-            }
-            res.set("Font", Object::Dictionary(fd));
-        }
-        if !res_x.is_empty() || !removed_names.is_empty() {
-            let mut xd = res.get(b"XObject").ok().and_then(|o| deref(doc, o).as_dict().ok()).cloned().unwrap_or_default();
-            for (n, id) in res_x {
-                xd.set(n.as_bytes().to_vec(), Object::Reference(id));
-            }
-            for n in removed_names {
-                xd.remove(n.as_bytes());
-            }
-            res.set("XObject", Object::Dictionary(xd));
-        }
-        if let Ok(Object::Dictionary(pd)) = doc.get_object_mut(pa.pid) {
-            pd.set("Resources", Object::Dictionary(res));
-        }
-    }
-    // ---- contents: two new streams; the old ones are dropped at the end when nothing else uses them
+    res_fonts.extend(add.fonts.iter().cloned());
+    res_x.extend(add.xs.iter().cloned());
+    put_resources(doc, pa.pid, res_fonts, res_x, add.gss.clone(), removed_names);
+    // ---- contents: new streams (watermark behind, the rewritten original, ours, watermark and header/footer in front);
+    // the old ones are dropped at the end when nothing else uses them
     let extra = (-pa.an.depth_min).max(0);
     let mut body = b"q\n".repeat(1 + extra as usize);
     body.extend(splice(&pa.joined, mods));
@@ -540,19 +624,72 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
     let added: Vec<u8> = segs.into_iter().flat_map(|s| s.1).collect();
     acc.old.extend(doc.get_page_contents(pa.pid));
     let mut ids = vec![];
-    for bytes in [body, added] {
-        let mut s = Stream::new(Dictionary::new(), bytes);
-        let _ = s.compress();
-        ids.push(Object::Reference(doc.add_object(s)));
+    for bytes in add.behind.iter().cloned().chain([body, added]).chain(add.front.iter().cloned()) {
+        ids.push(new_stream(doc, bytes));
     }
-    if let Ok(Object::Dictionary(pd)) = doc.get_object_mut(pa.pid) {
+    set_contents(doc, pa.pid, ids, acc);
+    Ok(info)
+}
+
+fn new_stream(doc: &mut Document, bytes: Vec<u8>) -> Object {
+    let mut s = Stream::new(Dictionary::new(), bytes);
+    let _ = s.compress();
+    Object::Reference(doc.add_object(s))
+}
+
+fn set_contents(doc: &mut Document, pid: ObjectId, ids: Vec<Object>, acc: &mut Acc) {
+    if let Ok(Object::Dictionary(pd)) = doc.get_object_mut(pid) {
         pd.set("Contents", Object::Array(ids));
         // a page thumbnail would still show the original content (and its pixels)
         if pd.remove(b"Thumb").is_some() {
             acc.prune = true;
         }
     }
-    Ok(info)
+}
+
+/// Fonts, XObjects and transparency states into the page's own resource dictionary; `rm` names leave the XObjects.
+fn put_resources(doc: &mut Document, pid: ObjectId, fonts: Vec<(String, ObjectId)>, xs: Vec<(String, ObjectId)>, gss: Vec<(String, ObjectId)>, rm: Vec<String>) {
+    if fonts.is_empty() && xs.is_empty() && gss.is_empty() && rm.is_empty() {
+        return;
+    }
+    let mut res = effective_resources(doc, pid).cloned().unwrap_or_default();
+    let sub = |res: &mut Dictionary, key: &str, add: Vec<(String, ObjectId)>, rm: &[String]| {
+        if add.is_empty() && rm.is_empty() {
+            return;
+        }
+        let mut d = res.get(key.as_bytes()).ok().and_then(|o| deref(doc, o).as_dict().ok()).cloned().unwrap_or_default();
+        for (n, id) in add {
+            d.set(n.as_bytes().to_vec(), Object::Reference(id));
+        }
+        for n in rm {
+            d.remove(n.as_bytes());
+        }
+        res.set(key, Object::Dictionary(d));
+    };
+    sub(&mut res, "Font", fonts, &[]);
+    sub(&mut res, "XObject", xs, &rm);
+    sub(&mut res, "ExtGState", gss, &[]);
+    if let Ok(Object::Dictionary(pd)) = doc.get_object_mut(pid) {
+        pd.set("Resources", Object::Dictionary(res));
+    }
+}
+
+/// A page without edits of its own that gets a watermark or header/footer: the original streams stay as they are,
+/// wrapped in q ... Q so our content starts from the default state.
+pub(super) fn light_page(doc: &mut Document, pid: ObjectId, add: &DocAdd, acc: &mut Acc) {
+    let joined = doc.get_page_content(pid).unwrap_or_default();
+    let an = content::analyse_with(&joined, &BTreeMap::new(), &|_| None, content::ID);
+    let extra = (-an.depth_min).max(0);
+    let open = b"q\n".repeat(1 + extra as usize);
+    let close = b"Q\n".repeat((1 + extra + an.depth_end).max(0) as usize);
+    put_resources(doc, pid, add.fonts.clone(), add.xs.clone(), add.gss.clone(), vec![]);
+    let orig = doc.get_page_contents(pid);
+    let mut ids: Vec<Object> = add.behind.iter().cloned().map(|b| new_stream(doc, b)).collect();
+    ids.push(new_stream(doc, open));
+    ids.extend(orig.into_iter().map(Object::Reference));
+    ids.push(new_stream(doc, close));
+    ids.extend(add.front.iter().cloned().map(|b| new_stream(doc, b)));
+    set_contents(doc, pid, ids, acc);
 }
 
 /// Typeset bytes of a text box (content space), its display rect with the real typeset size, and the PC font names it uses.
