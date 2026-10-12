@@ -57,11 +57,18 @@ or block it. If your IT team blocks it, that's the reason.
   - make selected words bold, italic, bigger or another colour, or change a paragraph's
     font and alignment;
   - white out an area. What's under it is really removed, not just covered, so it
-    can't be copied back out, and this works on scanned pages too;
+    can't be copied back out, and this works on scanned pages too. Comments and form
+    fields in that area go too. If something can't be removed safely (a few unusual
+    image types, for example), majipdf tells you and lets you decide whether a white
+    cover is enough;
   - add text boxes anywhere on the page;
   - place a signature or stamp, either imported from a photo or scan (the white
     background is removed for you) or drawn with the mouse or a pen. Your signatures
-    are kept on this computer only, ready for next time.
+    are kept on this computer only, ready for next time, and you can manage or delete
+    them in Settings;
+  - select existing images, lines and paragraphs to move, resize or delete them;
+  - add a watermark (text such as DRAFT or RAHASIA, or an image) and headers or
+    footers with page numbers ("Halaman 1 dari 10"), the date or the file name.
 
   Undo and redo work across everything, and the result is saved as `<name>_edited.pdf`.
 
@@ -79,8 +86,7 @@ A few things apply to every tool:
 ## Not there yet
 
 - OCR inside PDF to Word and Excel. For scans, run Scan to text first, then convert.
-- Moving or deleting existing images and text blocks, watermarks, and headers/footers
-  in Edit PDF.
+- Filling in PDF forms.
 - ZIP files as input for Compress. A folder works.
 - A macOS version. The code builds for macOS and passes automated checks, but I don't
   own a Mac, so it hasn't been properly tested by hand yet.
