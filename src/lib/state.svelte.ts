@@ -1,5 +1,5 @@
 import { clearThumbCache } from "./thumbcache";
-import type { EditDoc, EditHistory, EditSaveRes, PageModel, Style, Run, ObjReq, SigItem, ItemRef, HfPos } from "./edit";
+import type { EditDoc, EditHistory, EditSaveRes, PageModel, Style, Run, ObjReq, ObjEdit3, SigItem, ItemRef, HfPos } from "./edit";
 
 export const isMac = /Mac/.test(navigator.userAgent);
 
@@ -290,6 +290,7 @@ export const app = $state({
   route: "home" as "home" | ToolId,
   settingsOpen: false,
   aboutOpen: false,
+  sigManageOpen: false,
   dragging: false,
   home: {
     droppedFile: null as FileInfo | null,
@@ -388,7 +389,8 @@ export const app = $state({
     fonts: [] as string[],
     sigOpen: false,
     drawOpen: false,
-    woBar: null as { page: number; req: ObjReq; rect: [number, number, number, number] } | null, // whiteout_partial warning (request not applied)
+    woBar: null as { page: number; req: ObjReq | null; rect: [number, number, number, number]; batch?: ObjEdit3[]; annots?: number } | null, // whiteout_partial / remove_partial warning (request not applied)
+    saving: false, // Save is flushing / running: the editor is inert
     objError: "",
     leaveAsk: false,
     busy: false, // an undo/redo/apply call is in flight

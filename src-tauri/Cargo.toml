@@ -24,6 +24,7 @@ rust_xlsxwriter = "0.99.1"
 base64 = "0.22"
 lopdf = { version = "0.36", default-features = false }
 ttf-parser = "0.25"
+flate2 = "1.1" # already in the tree through lopdf; used for capped inflation
 sha2 = "0.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 

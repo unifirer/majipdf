@@ -158,8 +158,8 @@ fn is_marker(t: &str) -> bool {
     if n == 1 {
         return !t.chars().next().unwrap().is_alphanumeric();
     }
-    let (body, last) = t.split_at(t.len() - 1);
-    n <= 5 && (last == "." || last == ")") && body.chars().all(|c| c.is_ascii_alphanumeric())
+    let body = t.strip_suffix('.').or_else(|| t.strip_suffix(')'));
+    n <= 5 && body.is_some_and(|b| b.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 fn make_lines(segs: &[Seg]) -> Vec<Line> {
@@ -260,11 +260,19 @@ pub fn find_paras(pin: &PageIn) -> (Vec<Para>, f64) {
     }
     segs.extend(pin.forms.iter().cloned());
     let lines = make_lines(&segs);
+    // Lines come top to bottom. A paragraph can only take a line while its last line is within a few line heights above it,
+    // so only those "open" paragraphs are looked at (a sweep, not a scan of every paragraph for every line).
+    let reach = 2.5 * lines.iter().map(|l| l.size).fold(1.0, f64::max);
     let mut paras: Vec<Vec<usize>> = vec![];
+    let mut open: Vec<usize> = vec![];
     for (i, b) in lines.iter().enumerate() {
-        match paras.iter().rposition(|p| joinable(&lines, p, b)) {
-            Some(k) => paras[k].push(i),
-            None => paras.push(vec![i]),
+        open.retain(|&k| lines[*paras[k].last().unwrap()].base - b.base <= reach);
+        match open.iter().rposition(|&k| joinable(&lines, &paras[k], b)) {
+            Some(j) => paras[open[j]].push(i),
+            None => {
+                paras.push(vec![i]);
+                open.push(paras.len() - 1);
+            }
         }
     }
     let body: Vec<&Line> = lines.iter().filter(|l| l.class == 0).collect();
@@ -509,9 +517,16 @@ pub enum Fail {
 #[derive(Default)]
 pub struct PcSet {
     pub faces: Vec<((String, bool, bool), Pc)>,
+    pub base: usize, // names count up from here, past any MjF name the document already has
 }
 
 impl PcSet {
+    pub fn name(&self, idx: usize) -> String {
+        format!("MjF{}", self.base + idx + 1)
+    }
+    pub fn index_of(&self, font: &str) -> usize {
+        font.trim_start_matches("MjF").parse::<usize>().unwrap_or(self.base + 1).saturating_sub(self.base + 1)
+    }
     pub fn style_fam(&mut self, base: &str, bold: bool, italic: bool, size: f64, fill: &str) -> Result<Style, Fail> {
         let key = (family(base), bold, italic);
         let idx = match self.faces.iter().position(|x| x.0 == key) {
@@ -522,7 +537,7 @@ impl PcSet {
                 self.faces.len() - 1
             }
         };
-        Ok(Style { font: format!("MjF{}", idx + 1), size, fill: fill.into(), nb: 1, sp_code: Some(32), sp_w: self.faces[idx].1.widths[32].max(250.0), via_tw: true })
+        Ok(Style { font: self.name(idx), size, fill: fill.into(), nb: 1, sp_code: Some(32), sp_w: self.faces[idx].1.widths[32].max(250.0), via_tw: true })
     }
 }
 
@@ -656,8 +671,7 @@ pub fn retype_with(
 }
 
 fn face_w(pcs: &PcSet, font: &str, code: u8) -> f64 {
-    let i: usize = font.trim_start_matches("MjF").parse::<usize>().unwrap_or(1) - 1;
-    pcs.faces[i].1.widths[code as usize]
+    pcs.faces[pcs.index_of(font)].1.widths[code as usize]
 }
 
 // ---------------- breaking ----------------
@@ -1147,7 +1161,7 @@ mod tests {
         for t in ["1.", "a)", "\u{2022}", "12.", "-"] {
             assert!(is_marker(t), "{t}");
         }
-        for t in ["Hello", "A.B.C.D.E.F", "ab"] {
+        for t in ["Hello", "A.B.C.D.E.F", "ab", "café", "abcdefé", "éé"] {
             assert!(!is_marker(t), "{t}");
         }
     }

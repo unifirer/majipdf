@@ -1,8 +1,9 @@
 //! Per-page build: paragraph edits (neutralise, retype, push), white-outs (glyph and pixel removal, cover), text boxes and images,
 //! all as one rewritten original stream plus one appended stream in list (z) order. Contract: _docs/edit2-contract.md.
-use super::content::{self, conj, expand_range, glyph_boxes, glyph_hit, inv, mul, restore_ops, rewrite, shift_open, splice, text_restore, tr, Mod, M, OK};
+use super::content::{self, conj, expand_range, glyph_boxes, strip_alt_keys, glyph_hit, inv, mul, restore_ops, rewrite, shift_open, splice, text_restore, tr, Mod, M, OK};
 use super::fonts::{deref, effective_resources, embed_pc, pc_fnt, Fnt, Kind};
 use super::docobj::DocAdd;
+use super::scrub;
 use super::layout::{self, box_layout_items, emit, family, line_scales, retype_runs, retype_with, runs_from_words, typeset, Align, BoxItem, Restyle};
 use super::whiteout::{self, decode_images, new_image, open_smask, png_xobject, poly, rot_frame, src_of};
 use super::*;
@@ -24,6 +25,11 @@ pub(super) struct Acc {
     pub prune: bool,
     pub gs: BTreeMap<i64, (String, ObjectId)>, // transparency states by opacity (per mille), one object each
     pub dims: HashMap<String, (u32, u32)>,     // pixel size of placed assets
+    pub base: usize,                           // our resource names count up from here (past any name already in the document)
+    pub sanitised: HashSet<ObjectId>,          // image objects written by a white-out
+    pub rm_names: Vec<(ObjectId, Vec<String>)>, // page -> image names taken out of its resources
+    pub alt_pages: Vec<ObjectId>,              // pages that lose alternate text (destructive edits)
+    pub removed_annots: HashSet<ObjectId>,
 }
 
 struct Plan<'a> {
@@ -115,6 +121,9 @@ fn strip_text(seg: &[u8], fonts: &BTreeMap<String, Fnt>, rmat: M, rects: &[[f64;
     (splice(seg, mods), n)
 }
 
+/// Pixel removal decodes the whole image: past this many pixels a white-out over it is partial.
+const MAX_IMAGE_PX: u64 = 100_000_000;
+
 fn overlaps(a: [f64; 4], b: [f64; 4]) -> bool {
     a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
 }
@@ -144,6 +153,9 @@ pub(super) fn count_chars(s: &str) -> usize {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &Shared, acc: &mut Acc, add: &DocAdd) -> Result<PageInfo, BErr> {
     let [_, oy, _, _] = pa.page;
+    if pa.broken {
+        return Err(BErr::Other("page too complex".into()));
+    }
     // ---- paragraph plans: edited paragraphs, plus moved or removed ones that have no edit of their own (their text unchanged)
     let mut plans: Vec<Plan> = vec![];
     let mut cands: Vec<(usize, Edit, bool)> = vec![];
@@ -338,11 +350,33 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
     let mvs: Vec<&MvE> = items.iter().filter_map(|x| if let Item::Mv(m) = x { (m.kind != IKind::Para).then_some(m) } else { None }).collect();
     let find_item = |m: &MvE| pa.items.iter().find(|x| x.kind == m.kind && x.id == m.id);
     let gone_ops: HashSet<usize> = mvs.iter().filter(|m| m.removed).filter_map(|m| find_item(m)).filter(|pi| pi.kind == IKind::Image && pi.op != usize::MAX).map(|pi| pi.op).collect();
+    // where an image really sits: the move / resize of the Select tool applied to its own transform
+    let img_tf: HashMap<usize, (M, [f64; 4])> = mvs
+        .iter()
+        .filter(|m| !m.removed && m.kind == IKind::Image)
+        .filter_map(|m| {
+            let (pi, r) = (find_item(m)?, m.rect?);
+            if pi.op == usize::MAX {
+                return None;
+            }
+            let (nw, ob) = (rect_work(pa, r), pi.bbox);
+            let (sx, sy) = ((nw[2] - nw[0]) / (ob[2] - ob[0]).max(1e-6), (nw[3] - nw[1]) / (ob[3] - ob[1]).max(1e-6));
+            Some((pi.op, ([sx, 0.0, 0.0, sy, nw[0] - sx * ob[0], nw[1] - sy * ob[1]], nw)))
+        })
+        .collect();
+    let to_user = |w: [f64; 4]| -> [f64; 4] {
+        let u = pa.rinv;
+        let pts = [(w[0], w[1]), (w[2], w[1]), (w[2], w[3]), (w[0], w[3])].map(|(x, y)| (x * u[0] + y * u[2] + u[4], x * u[1] + y * u[3] + u[5]));
+        [pts.iter().map(|p| p.0).fold(f64::MAX, f64::min), pts.iter().map(|p| p.1).fold(f64::MAX, f64::min), pts.iter().map(|p| p.0).fold(f64::MIN, f64::max), pts.iter().map(|p| p.1).fold(f64::MIN, f64::max)]
+    };
+    let mut ann_idx: HashSet<usize> = HashSet::new();
+    let mut ann_partial = 0usize;
     let wos: Vec<(usize, &ObjE)> = items.iter().enumerate().filter_map(|(i, it)| if let Item::Obj(o) = it { (o.kind == ObjKind::WhiteOut).then_some((i, o)) } else { None }).collect();
     let wrects: Vec<[f64; 4]> = wos.iter().map(|(_, o)| rect_work(pa, o.rect)).collect();
     let mut res_fonts: Vec<(String, ObjectId)> = vec![];
     let mut res_x: Vec<(String, ObjectId)> = vec![];
     let mut res_rm: Vec<String> = vec![];
+    let mut replaced_ops: HashSet<usize> = HashSet::new();
     let mut used_pc: BTreeSet<String> = BTreeSet::new();
     let mut partial: Vec<usize> = vec![0; wos.len()];
     let mut partial_img: Vec<bool> = vec![false; wos.len()];
@@ -353,6 +387,19 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             }
             let tot = tot_shift(s.op);
             let removable = pa.fonts.get(&s.font).is_some_and(|f| f.measurable && f.kind != Kind::Type3);
+            if !removable {
+                // no widths (or Type3): how far the text reaches is unknown. Any such text on a line the white-out touches, starting left of its
+                // right edge, counts as under it: fail closed (partial) rather than remove nothing.
+                let n = s.glyphs.iter().filter(|g| !g.text.as_deref().is_some_and(|t| t.trim().is_empty())).count();
+                let (y0, y1) = (s.base - 0.22 * s.size, s.base + 0.78 * s.size);
+                let x1 = if s.x1 - s.x0 < 1e-6 { f64::MAX } else { s.x0.max(s.x1) };
+                for (wi, r) in wrects.iter().enumerate() {
+                    if n > 0 && [*r, [r[0], r[1] + tot, r[2], r[3] + tot]].iter().any(|rr| overlaps([s.x0.min(s.x1), y0, x1, y1], *rr)) {
+                        partial[wi] += n.max(1);
+                    }
+                }
+                continue;
+            }
             let boxes = glyph_boxes(s);
             let mut keep = vec![true; boxes.len()];
             for (wi, r) in wrects.iter().enumerate() {
@@ -371,6 +418,10 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
                 info.removed += keep.iter().zip(&s.glyphs).filter(|(k, g)| !**k && !g.text.as_deref().is_some_and(|t| t.trim().is_empty())).count();
                 mods.push(Mod { s: s.start, e: s.end, bytes: rewrite(s, &|i| keep.get(i).copied().unwrap_or(true)), prio: 0 });
             }
+        }
+        if pa.form_over {
+            // more form text than we measure: we cannot say what is under the white-out
+            partial.iter_mut().for_each(|p| *p += 1);
         }
         for (wi, r) in wrects.iter().enumerate() {
             for sg in &pa.form_segs {
@@ -395,19 +446,11 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             let Object::Stream(s) = deref(doc, xo.as_ref()?.get(name.as_bytes()).ok()?) else { return None };
             Some((s.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) == Some(b"Image"), src_of(&s.dict)))
         };
-        for (i, o) in ops.iter().enumerate() {
-            if o.k != OK::Do || gone_ops.contains(&i) {
-                continue;
-            }
-            let (Some(b), Some(name)) = (o.bbox, do_name(&pa.joined, o)) else { continue };
-            if !sub_of(doc, &name).is_some_and(|x| x.0) {
-                continue;
-            }
-            let tot = tot_shift(i);
+        let test = |eb: [f64; 4], tot: f64| -> (Vec<usize>, Vec<[f64; 4]>) {
             let (mut wis, mut rects) = (vec![], vec![]);
             for (wi, r) in wrects.iter().enumerate() {
                 for rr in [*r, [r[0], r[1] + tot, r[2], r[3] + tot]] {
-                    if overlaps(b, rr) {
+                    if overlaps(eb, rr) {
                         if !wis.contains(&wi) {
                             wis.push(wi);
                         }
@@ -415,8 +458,52 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
                     }
                 }
             }
+            (wis, rects)
+        };
+        for (i, o) in ops.iter().enumerate() {
+            if gone_ops.contains(&i) {
+                continue;
+            }
+            let inline = o.k == OK::Paint && content::op_name(&pa.joined, o) == "BI";
+            if o.k != OK::Do && !inline {
+                continue;
+            }
+            let tot = tot_shift(i);
+            if inline {
+                // ponytail: pixels of an inline image are not rewritten; fail closed so the user chooses "cover only"
+                if let Some(b) = o.bbox {
+                    for w in test(img_tf.get(&i).map(|t| t.1).unwrap_or(b), tot).0 {
+                        partial_img[w] = true;
+                    }
+                }
+                continue;
+            }
+            let Some(name) = do_name(&pa.joined, o) else { continue };
+            // an image we cannot identify or place cannot be cleaned: fail closed for every white-out
+            let Some((is_img, src0)) = sub_of(doc, &name) else {
+                partial_img.iter_mut().for_each(|p| *p = true);
+                continue;
+            };
+            if !is_img {
+                continue;
+            }
+            let Some(b) = o.bbox else {
+                partial_img.iter_mut().for_each(|p| *p = true);
+                continue;
+            };
+            let ctm0 = pa.an.snaps[o.snap as usize].ctm;
+            // an image too large to take apart in memory: fail closed
+            if src0.px > MAX_IMAGE_PX {
+                partial_img.iter_mut().for_each(|p| *p = true);
+                continue;
+            }
+            let (eb, ctm) = match img_tf.get(&i) {
+                Some((a, nw)) => (*nw, mul(ctm0, *a)),
+                None => (b, ctm0),
+            };
+            let (wis, rects) = test(eb, tot);
             if !wis.is_empty() {
-                hits.push(Hit { op: i, name, ctm: pa.an.snaps[o.snap as usize].ctm, wis, rects });
+                hits.push(Hit { op: i, name, ctm, wis, rects });
             }
         }
         if !hits.is_empty() {
@@ -439,10 +526,18 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
                 };
                 let (_, src) = sub_of(doc, &h.name).unwrap();
                 whiteout::whiten(&mut pix, h.ctm, &h.rects, src.mask);
-                let sm = src.smask.map(|id| open_smask(doc, id, h.ctm, &h.rects).unwrap_or(id));
+                let sm = src.smask.and_then(|id| open_smask(doc, id, h.ctm, &h.rects));
+                // a mask we cannot sanitise (or a /Mask) would keep the removed shape: fail closed
+                if src.has_mask || (src.has_smask && sm.is_none()) {
+                    h.wis.iter().for_each(|&w| partial_img[w] = true);
+                    kept_names.insert(h.name.clone());
+                    continue;
+                }
                 let id = new_image(doc, &pix, &src, sm).map_err(BErr::Other)?;
+                acc.sanitised.insert(id);
+                replaced_ops.insert(h.op);
                 acc.nimg += 1;
-                let nm = format!("MjWo{}", acc.nimg);
+                let nm = format!("MjWo{}", acc.base + acc.nimg);
                 res_x.push((nm.clone(), id));
                 mods.push(Mod { s: ops[h.op].s, e: ops[h.op].e, bytes: format!("/{nm} Do").into_bytes(), prio: 0 });
                 replaced.insert(h.name.clone());
@@ -457,9 +552,16 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             }
             res_rm.extend(replaced.difference(&kept_names).cloned());
         }
+        // annotations (form values, comments, links) under a white-out go with it; one only partly under it makes the white-out partial
+        let wo_user: Vec<[f64; 4]> = wos.iter().enumerate().filter(|(_, (_, o))| !o.cover_only).map(|(wi, _)| to_user(wrects[wi])).collect();
+        if !wo_user.is_empty() {
+            let (i, p) = scrub::find_annots(doc, pa.pid, &wo_user);
+            ann_idx.extend(i);
+            ann_partial = p;
+        }
         for (wi, (_, o)) in wos.iter().enumerate() {
-            if (partial[wi] > 0 || partial_img[wi]) && !o.cover_only {
-                return Err(BErr::Partial(partial[wi]));
+            if (partial[wi] > 0 || partial_img[wi] || ann_partial > 0) && !o.cover_only {
+                return Err(BErr::Partial(partial[wi], ann_partial));
             }
         }
     }
@@ -519,6 +621,22 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
             mods.push(Mod { s: o.e, e: o.e, bytes: b"\nQ\n".to_vec(), prio: -3000 });
         }
     }
+    // annotations under a removed paragraph or image
+    for m in mvs.iter().copied().chain(items.iter().filter_map(|x| if let Item::Mv(m) = x { (m.kind == IKind::Para).then_some(m) } else { None })) {
+        if !m.removed || m.kind == IKind::Path {
+            continue;
+        }
+        let wb = match m.kind {
+            IKind::Para => pa.paras.get(m.id as usize).map(|p| [p.l, p.bot, p.r, p.top]),
+            _ => find_item(m).map(|pi| pi.bbox),
+        };
+        let Some(wb) = wb else { continue };
+        let (i, p) = scrub::find_annots(doc, pa.pid, &[to_user(wb)]);
+        if p > 0 && !m.cover {
+            return Err(BErr::RemovePartial(pa.idx, m.kind, m.id, p));
+        }
+        ann_idx.extend(i);
+    }
     for n in gone_names {
         let still = ops.iter().enumerate().any(|(j, x)| x.k == OK::Do && !gone_ops.contains(&j) && do_name(&pa.joined, x).as_deref() == Some(n.as_str()));
         if !still && !res_rm.contains(&n) {
@@ -563,12 +681,17 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
                     }
                 }
                 ObjKind::WhiteOut => {
+                    // an image placed earlier (signature, stamp) cannot be cleaned pixel by pixel here: fail closed
+                    let disp = |r: [f64; 4]| [r[0], r[1], r[0] + r[2], r[1] + r[3]];
+                    if !o.cover_only && items[..ii].iter().any(|x| matches!(x, Item::Obj(p) if p.kind == ObjKind::Image && p.page == o.page && overlaps(disp(p.rect), disp(o.rect)))) {
+                        return Err(BErr::Partial(0, 0));
+                    }
                     let r = rect_work(pa, o.rect);
                     if segs.iter().any(|s| s.0 == 0) {
                         if font_map.is_none() {
                             let mut m = pa.fonts.clone();
                             for (i, (_, pc)) in acc.pcs.faces.iter().enumerate() {
-                                m.insert(format!("MjF{}", i + 1), pc_fnt(&format!("MjF{}", i + 1), pc));
+                                m.insert(acc.pcs.name(i), pc_fnt(&acc.pcs.name(i), pc));
                             }
                             font_map = Some(m);
                         }
@@ -586,7 +709,7 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
                     if !acc.asset_objs.contains_key(&o.asset) {
                         let n = acc.asset_objs.len() + 1;
                         let id = png_xobject(doc, png).map_err(BErr::Other)?;
-                        acc.asset_objs.insert(o.asset.clone(), (format!("MjSg{n}"), id));
+                        acc.asset_objs.insert(o.asset.clone(), (format!("MjSg{}", acc.base + n), id));
                     }
                     let (name, id) = acc.asset_objs[&o.asset].clone();
                     res_x.push((name.clone(), id));
@@ -604,14 +727,48 @@ pub(super) fn build_page(doc: &mut Document, pa: &PageAn, items: &[&Item], sh: &
         used_pc.extend(p.styles.iter().map(|s| s.font.clone()).filter(|n| n.starts_with("MjF")));
     }
     for n in used_pc {
-        let fi = n.trim_start_matches("MjF").parse::<usize>().unwrap_or(1) - 1;
+        let fi = acc.pcs.index_of(&n);
         let id = *acc.pc_objs.entry(fi).or_insert_with(|| embed_pc(doc, &acc.pcs.faces[fi].1));
         res_fonts.push((n, id));
     }
+    // every other name on the page that binds the same image object, and is no longer drawn, goes with it
+    let xo_all = effective_resources(doc, pa.pid).and_then(|r| r.get(b"XObject").ok()).and_then(|o| deref(doc, o).as_dict().ok()).cloned().unwrap_or_default();
+    let rm_ids: HashSet<ObjectId> = res_rm.iter().filter_map(|n| xo_all.get(n.as_bytes()).ok().and_then(|o| o.as_reference().ok())).collect();
+    if !rm_ids.is_empty() {
+        let drawn: HashSet<String> = ops.iter().enumerate().filter(|(i, o)| o.k == OK::Do && !gone_ops.contains(i) && !replaced_ops.contains(i)).filter_map(|(_, o)| do_name(&pa.joined, o)).collect();
+        for (k, v) in xo_all.iter() {
+            let n = String::from_utf8_lossy(k).to_string();
+            if v.as_reference().ok().is_some_and(|id| rm_ids.contains(&id)) && !drawn.contains(&n) && !res_rm.contains(&n) {
+                res_rm.push(n);
+            }
+        }
+    }
     let removed_names = res_rm;
+    if !removed_names.is_empty() {
+        acc.rm_names.push((pa.pid, removed_names.clone()));
+    }
+    // a destructive edit also takes the alternate text and the annotations that describe the removed content, and prunes
+    let destructive = wos.iter().any(|(_, o)| !o.cover_only) || items.iter().any(|x| matches!(x, Item::Mv(m) if m.removed)) || !plans.is_empty();
+    if destructive {
+        acc.prune = true;
+        acc.alt_pages.push(pa.pid);
+        for o in ops.iter().filter(|o| content::op_name(&pa.joined, o) == "BDC") {
+            let t = &pa.joined[o.s..o.e];
+            let n = strip_alt_keys(t);
+            if n != t {
+                mods.push(Mod { s: o.s, e: o.e, bytes: n, prio: 0 });
+            }
+        }
+    }
+    if !ann_idx.is_empty() {
+        acc.removed_annots.extend(scrub::remove_annots(doc, pa.pid, &ann_idx));
+    }
     res_fonts.extend(add.fonts.iter().cloned());
     res_x.extend(add.xs.iter().cloned());
     put_resources(doc, pa.pid, res_fonts, res_x, add.gss.clone(), removed_names);
+    if destructive {
+        scrub::strip_properties(doc, pa.pid);
+    }
     // ---- contents: new streams (watermark behind, the rewritten original, ours, watermark and header/footer in front);
     // the old ones are dropped at the end when nothing else uses them
     let extra = (-pa.an.depth_min).max(0);
@@ -677,7 +834,7 @@ fn put_resources(doc: &mut Document, pid: ObjectId, fonts: Vec<(String, ObjectId
 /// A page without edits of its own that gets a watermark or header/footer: the original streams stay as they are,
 /// wrapped in q ... Q so our content starts from the default state.
 pub(super) fn light_page(doc: &mut Document, pid: ObjectId, add: &DocAdd, acc: &mut Acc) {
-    let joined = doc.get_page_content(pid).unwrap_or_default();
+    let joined = super::fonts::page_content(doc, pid).unwrap_or_default();
     let an = content::analyse_with(&joined, &BTreeMap::new(), &|_| None, content::ID);
     let extra = (-an.depth_min).max(0);
     let open = b"q\n".repeat(1 + extra as usize);
@@ -731,7 +888,7 @@ fn textbox_bytes(pa: &PageAn, o: &ObjE, sh: &Shared, acc: &mut Acc, d2u_m: M) ->
             None => {
                 let fam = if fmt.font == "orig" { fam_def.clone() } else { fmt.font.clone() };
                 let st = acc.pcs.style_fam(&fam, fmt.bold, fmt.italic, fmt.size, &fill).map_err(fail)?;
-                let idx = st.font.trim_start_matches("MjF").parse::<usize>().unwrap_or(1).max(1) - 1;
+                let idx = acc.pcs.index_of(&st.font);
                 let wd = acc.pcs.faces[idx].1.widths;
                 (st, Some(wd))
             }

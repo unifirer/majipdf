@@ -60,6 +60,92 @@ struct T {
     e: usize,
 }
 
+/// Budgets against crafted pages: ops, state snapshots, distinct ExtGStates.
+const MAX_OPS: usize = 1_000_000;
+const MAX_SNAPS: usize = 300_000;
+const MAX_GS: usize = 32;
+
+/// A PDF name without its slash, `#xx` escapes decoded.
+pub fn decode_name(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'#' && i + 2 < raw.len() + 0 && raw.len() >= i + 3 {
+            if let Some(v) = std::str::from_utf8(&raw[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into()
+}
+
+/// The names of the XObjects a content stream draws (Do), escapes decoded.
+pub fn do_names(b: &[u8]) -> HashSet<String> {
+    let toks = lex(b);
+    let mut out = HashSet::new();
+    for (i, t) in toks.iter().enumerate() {
+        if matches!(&t.k, K::Op(o) if o == "Do") && i > 0 {
+            if let K::Name(n) = &toks[i - 1].k {
+                out.insert(n.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A dictionary or op text without the keys that carry alternate text (/ActualText, /Alt, /E) and their values.
+pub fn strip_alt_keys(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'(' {
+            let e = lex_string(b, i).1;
+            out.extend_from_slice(&b[i..e]);
+            i = e;
+            continue;
+        }
+        if b[i] == b'/' {
+            let mut e = i + 1;
+            while e < b.len() && !is_ws(b[e]) && !is_delim(b[e]) {
+                e += 1;
+            }
+            let key = decode_name(&b[i + 1..e]);
+            if matches!(key.as_str(), "ActualText" | "Alt" | "E") {
+                let mut j = e;
+                while j < b.len() && is_ws(b[j]) {
+                    j += 1;
+                }
+                if j < b.len() {
+                    j = match b[j] {
+                        b'(' => lex_string(b, j).1,
+                        b'<' if b.get(j + 1) != Some(&b'<') => lex_hex(b, j).1,
+                        b'/' => {
+                            let mut k = j + 1;
+                            while k < b.len() && !is_ws(b[k]) && !is_delim(b[k]) {
+                                k += 1;
+                            }
+                            k
+                        }
+                        _ => j,
+                    };
+                }
+                i = j;
+                continue;
+            }
+            out.extend_from_slice(&b[i..e]);
+            i = e;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 fn is_ws(c: u8) -> bool {
     matches!(c, 0 | 9 | 10 | 12 | 13 | 32)
 }
@@ -341,7 +427,7 @@ fn lex(b: &[u8]) -> Vec<T> {
                 while i < b.len() && !is_ws(b[i]) && !is_delim(b[i]) {
                     i += 1;
                 }
-                v.push(T { k: K::Name(String::from_utf8_lossy(&b[s + 1..i]).into()), s, e: i });
+                v.push(T { k: K::Name(decode_name(&b[s + 1..i])), s, e: i });
             }
             _ => {
                 while i < b.len() && !is_ws(b[i]) && !is_delim(b[i]) {
@@ -389,7 +475,7 @@ pub struct GS {
     pub join: String,
     pub miter: String,
     pub dash: String,
-    pub gs: String,
+    pub gs: Vec<String>, // distinct ExtGState invocations, last use last (the effective state, not the history)
 }
 
 impl GS {
@@ -414,7 +500,7 @@ impl GS {
             join: String::new(),
             miter: String::new(),
             dash: String::new(),
-            gs: String::new(),
+            gs: Vec::new(),
         }
     }
 }
@@ -444,9 +530,14 @@ pub fn restore_ops(before: &GS, after: &GS) -> Option<String> {
             let _ = write!(s, "{a} ");
         }
     }
-    for (b, a) in [(&before.lw_op, &after.lw_op), (&before.cap, &after.cap), (&before.join, &after.join), (&before.miter, &after.miter), (&before.dash, &after.dash), (&before.gs, &after.gs)] {
+    for (b, a) in [(&before.lw_op, &after.lw_op), (&before.cap, &after.cap), (&before.join, &after.join), (&before.miter, &after.miter), (&before.dash, &after.dash)] {
         if b != a {
             let _ = write!(s, "{a} ");
+        }
+    }
+    if before.gs != after.gs {
+        for g in &after.gs {
+            let _ = write!(s, "{g} ");
         }
     }
     Some(s)
@@ -540,6 +631,7 @@ pub struct Analysis {
     pub spans: Vec<(usize, usize, bool)>, // (open op, close op, is_bt)
     pub depth_end: i32,
     pub depth_min: i32,
+    pub overflow: bool, // over the op / state budget: the analysis stopped early and the page must be locked
 }
 
 pub fn fmt(x: f64) -> String {
@@ -590,12 +682,16 @@ pub fn analyse_with(b: &[u8], fonts: &BTreeMap<String, Fnt>, xobj: &dyn Fn(&str)
     let mut bt_open: Option<usize> = None;
     let mut mc = 0i32;
     let mut depth = 0i32;
-    let mut a = Analysis { ops: vec![], shows: vec![], snaps: vec![], spans: vec![], depth_end: 0, depth_min: 0 };
+    let mut a = Analysis { ops: vec![], shows: vec![], snaps: vec![], spans: vec![], depth_end: 0, depth_min: 0, overflow: false };
     let n = |t: &T| if let K::Num(x) = t.k { x } else { 0.0 };
     // second, simpler loop: operands are the tokens since the previous operator
     let mut first = 0usize;
     for (ti, t) in toks.iter().enumerate() {
         let K::Op(op) = &t.k else { continue };
+        if a.ops.len() > MAX_OPS || snaps.len() > MAX_SNAPS {
+            a.overflow = true;
+            break;
+        }
         let args: Vec<&T> = toks[first..ti].iter().collect();
         first = ti + 1;
         let nums: Vec<f64> = args.iter().map(|t| n(t)).collect();
@@ -643,10 +739,13 @@ pub fn analyse_with(b: &[u8], fonts: &BTreeMap<String, Fnt>, xobj: &dyn Fn(&str)
             "M" => (gs.miter, k, state_changed) = (text_of(s0), OK::State, true),
             "d" => (gs.dash, k, state_changed) = (text_of(s0), OK::State, true),
             "gs" => {
-                if !gs.gs.is_empty() {
-                    gs.gs.push(' ');
+                let t = text_of(s0);
+                gs.gs.retain(|x| *x != t);
+                gs.gs.push(t);
+                if gs.gs.len() > MAX_GS {
+                    gs.gs.remove(0);
+                    a.overflow = true;
                 }
-                gs.gs.push_str(&text_of(s0));
                 (k, state_changed) = (OK::State, true);
             }
             "g" | "rg" | "k" => (gs.fill_cs, gs.fill, k, state_changed) = (String::new(), text_of(s0), OK::State, true),

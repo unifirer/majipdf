@@ -154,6 +154,10 @@ export async function sigRename(id: string, name: string) {
   const it = lib.find((x) => x.id === id);
   if (it) it.name = name;
 }
+export async function sigClear() {
+  await sleep(100);
+  lib = [];
+}
 export async function sigDelete(id: string) {
   await sleep(100);
   lib = lib.filter((x) => x.id !== id);
@@ -335,6 +339,7 @@ export async function redo(): Promise<EditHistory> {
 }
 export const history = async (): Promise<EditHistory> => hist();
 export async function save(_r: EditSaveReq): Promise<EditSaveRes> {
+  log("save");
   await sleep(1500);
   return { output: "C:/mock/Laporan_Contoh_edited.pdf", size: 210 * 1024, seconds: 2 };
 }
@@ -342,6 +347,7 @@ export async function close(): Promise<void> {}
 
 // ---- Edit 3: existing items, watermark, header & footer ----
 export async function applyBatch(edits: ObjEdit3[]): Promise<BatchRes> {
+  log("batch:" + edits.map((x) => `${x.kind}${x.item.kind}${x.item.id}`).join(","));
   await sleep(250);
   for (const ed of edits) {
     const it = ed.item.kind === "para" ? undefined : (pages[ed.page].items as Art[]).find((x) => x.kind === ed.item.kind && x.id === ed.item.id);
@@ -373,7 +379,10 @@ const badPages = (ranges: string): DocRes | null => {
   const r = parseRanges(ranges, 2);
   return "error" in r ? { kind: "bad_pages", reason: `Bad page range "${ranges}"` } : null;
 };
+// Call order log for checks: window.__mockCalls
+const log = (n: string) => ((globalThis as unknown as { __mockCalls: string[] }).__mockCalls ??= []).push(n);
 export async function watermark(r: WmReq): Promise<DocRes> {
+  log("watermark:" + (r.text ?? ""));
   await sleep(250);
   const bad = badPages(r.pages);
   if (bad) return bad;

@@ -129,7 +129,7 @@ fn mv(page: u32, kind: IKind, id: u32, dx: f64, dy: f64) -> ObjEdit3 {
 }
 
 fn rm(page: u32, kind: IKind, id: u32) -> ObjEdit3 {
-    ObjEdit3::Remove { page, item: ItemRef { kind, id } }
+    ObjEdit3::Remove { page, item: ItemRef { kind, id }, cover_only: false }
 }
 
 fn batch_ok(s: &mut Session, edits: Vec<ObjEdit3>) -> Vec<PageModel> {
@@ -721,3 +721,6 @@ fn e3_date_placeholders() {
     assert_eq!(docobj::date_text(20_737, "id"), "11 Oktober 2026");
     assert_eq!(docobj::date_text(20_737, "en"), "11 October 2026");
 }
+
+#[path = "tests_sec.rs"]
+mod sec;

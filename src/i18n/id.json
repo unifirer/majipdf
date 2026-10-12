@@ -329,7 +329,7 @@
   "editHintAdd": "Klik di halaman, di tempat teks baru akan diletakkan.",
   "editHintWo": "Tarik kotak di atas bagian yang ingin dihapus. Teks dan gambar di bawahnya benar-benar dihapus, bukan sekadar ditutup.",
   "editHintSig": "Pilih tanda tangan atau stempel, lalu klik di halaman untuk meletakkannya.",
-  "editWoPartial": "Sebagian teks di bawah kotak ini bagian dari elemen berulang dan tidak bisa dihapus, hanya ditutup. Teks itu masih bisa disalin dari PDF.",
+  "editWoPartial": "Sebagian isi di bawah kotak ini tidak bisa dihapus, hanya ditutup kotak putih. Aslinya tetap ada di dalam file dan masih bisa dipulihkan dengan aplikasi penyunting PDF.",
   "editWoCover": "Tutup saja",
   "editWoUndo": "Batalkan hapus area",
   "sigImport": "Impor gambar…",
@@ -411,5 +411,12 @@
   "hfTooLong": "Teks ini terlalu panjang untuk muat di lebar halaman. Persingkat.",
   "wmEmpty": "Ketik dulu teks tanda airnya.",
   "hfDateId": "tanggal (ID)",
-  "hfDateEn": "tanggal (EN)"
+  "hfDateEn": "tanggal (EN)",
+  "sigClearAll": "Hapus semua",
+  "sigClearAsk": "Hapus semua tanda tangan dan stempel tersimpan dari komputer ini? Yang sudah dipakai di dokumen tetap ada.",
+  "editRmPartial": "Sebagian objek ini tidak bisa dihapus, hanya ditutup kotak putih. Aslinya tetap ada di dalam file dan masih bisa dipulihkan dengan aplikasi penyunting PDF.",
+  "editWoAnnots": "{n} komentar atau isian formulir di sini hanya tertutup sebagian dan tetap ada di file.",
+  "setSigs": "Tanda tangan & stempel tersimpan",
+  "setSigsCount": "{n} tersimpan",
+  "setSigsManage": "Kelola…"
 }

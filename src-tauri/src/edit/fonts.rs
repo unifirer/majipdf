@@ -136,6 +136,10 @@ fn glyph_char(n: &str) -> Option<char> {
 }
 
 fn utf16(h: &str) -> String {
+    // hex digits only (a malformed CMap can carry anything); sliced by bytes, so only ASCII is accepted
+    if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return String::new();
+    }
     let units: Vec<u16> = (0..h.len() / 4).filter_map(|i| u16::from_str_radix(&h[i * 4..i * 4 + 4], 16).ok()).collect();
     String::from_utf16_lossy(&units)
 }
@@ -193,9 +197,27 @@ pub fn parse_tounicode(b: &[u8]) -> HashMap<u32, String> {
 
 // ---------------- loading ----------------
 
+#[allow(unused_imports)]
+pub use super::decode::{plain, plain_cap, DecErr, MAX_STREAM};
+
+/// The page's content streams joined without a separator (as lopdf does). Err when a stream cannot be decoded within the cap:
+/// the bytes of an undecoded stream are never content.
+pub fn page_content(doc: &Document, page: ObjectId) -> Result<Vec<u8>, DecErr> {
+    let mut out = Vec::new();
+    for id in doc.get_page_contents(page) {
+        if let Ok(s) = doc.get_object(id).and_then(Object::as_stream) {
+            out.extend(plain(s)?);
+            if out.len() > MAX_STREAM {
+                return Err(DecErr::OverCap);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn stream_bytes(doc: &Document, o: Option<&Object>) -> Option<Vec<u8>> {
     match o.map(|o| deref(doc, o)) {
-        Some(Object::Stream(s)) => s.get_plain_content().ok().or_else(|| Some(s.content.clone())),
+        Some(Object::Stream(s)) => plain(s).ok(),
         _ => None,
     }
 }
@@ -550,7 +572,7 @@ pub fn used_codes(doc: &Document) -> HashMap<ObjectId, HashSet<u32>> {
     let mut m: HashMap<ObjectId, HashSet<u32>> = HashMap::new();
     for pid in doc.page_iter() {
         let fonts = load_fonts(doc, pid);
-        let Ok(joined) = doc.get_page_content(pid) else { continue };
+        let Ok(joined) = page_content(doc, pid) else { continue };
         for (fname, codes) in super::content::codes_by_font(&joined, &fonts) {
             if let Some(id) = fonts.get(&fname).and_then(|f| f.id) {
                 m.entry(id).or_default().extend(codes);

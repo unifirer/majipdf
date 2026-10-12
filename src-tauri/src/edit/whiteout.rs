@@ -88,13 +88,23 @@ fn has_filter(d: &Dictionary, name: &[u8]) -> bool {
 
 /// The image XObject of a page resource name, with its dictionary facts.
 pub struct Src {
+    pub px: u64, // Width x Height from the dictionary (u64::MAX when not readable)
+    pub has_smask: bool, // an /SMask entry (even a malformed one)
+    pub has_mask: bool, // a /Mask entry (stencil or colour key): not rewritten here
     pub mask: bool,
     pub dct: bool,
     pub smask: Option<ObjectId>,
 }
 
+fn dims(d: &Dictionary) -> u64 {
+    match (d.get(b"Width"), d.get(b"Height")) {
+        (Ok(Object::Integer(w)), Ok(Object::Integer(h))) if *w > 0 && *h > 0 => (*w as u64).saturating_mul(*h as u64),
+        _ => u64::MAX,
+    }
+}
+
 pub fn src_of(d: &Dictionary) -> Src {
-    Src { mask: matches!(d.get(b"ImageMask"), Ok(Object::Boolean(true))), dct: has_filter(d, b"DCTDecode"), smask: d.get(b"SMask").ok().and_then(|o| o.as_reference().ok()) }
+    Src { px: dims(d), has_smask: d.has(b"SMask"), has_mask: d.has(b"Mask"), mask: matches!(d.get(b"ImageMask"), Ok(Object::Boolean(true))), dct: has_filter(d, b"DCTDecode"), smask: d.get(b"SMask").ok().and_then(|o| o.as_reference().ok()) }
 }
 
 /// Makes the new XObject for whitened pixels. Flate, or DCT q90 when the source was DCT; stencil masks stay 1-bit masks.
@@ -137,19 +147,38 @@ pub fn new_image(doc: &mut Document, pix: &Pix, src: &Src, smask: Option<ObjectI
     Ok(doc.add_object(stream))
 }
 
-/// A copy of the soft mask with the placement's rects set opaque (8-bit gray masks of any size); None when it can't be read.
+/// A copy of the soft mask with the placement's rects set opaque. None when it can't be sanitised (not 8 bits per pixel, a size that
+/// doesn't match its data, a Decode we don't understand, too large): the caller must then fail closed, never keep the original mask.
 pub fn open_smask(doc: &mut Document, id: ObjectId, ctm: M, rects: &[[f64; 4]]) -> Option<ObjectId> {
     let Object::Stream(s) = doc.get_object(id).ok()?.clone() else { return None };
-    let (w, h) = (deref(doc, s.dict.get(b"Width").ok()?).as_i64().ok()? as u32, deref(doc, s.dict.get(b"Height").ok()?).as_i64().ok()? as u32);
-    if s.dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()) != Some(8) {
+    let dim = |k: &[u8]| -> Option<u32> { u32::try_from(deref(doc, s.dict.get(k).ok()?).as_i64().ok()?).ok().filter(|v| *v > 0) };
+    let (w, h) = (dim(b"Width")?, dim(b"Height")?);
+    if s.dict.get(b"BitsPerComponent").ok().and_then(|o| deref(doc, o).as_i64().ok()) != Some(8) {
         return None;
     }
-    let data = s.decompressed_content().ok()?;
-    if data.len() != (w * h) as usize {
+    let n = (w as usize).checked_mul(h as usize)?;
+    // Decode [1 0] reverses the meaning of the samples; anything but [0 1] / [1 0] is not understood
+    let invert = match s.dict.get(b"Decode").ok().map(|o| deref(doc, o)) {
+        None => false,
+        Some(Object::Array(a)) => match a.iter().map(|o| super::fonts::num(deref(doc, o))).collect::<Vec<_>>()[..] {
+            [x, y] if x == 0.0 && y == 1.0 => false,
+            [x, y] if x == 1.0 && y == 0.0 => true,
+            _ => return None,
+        },
+        Some(_) => return None,
+    };
+    let mut data = super::fonts::plain(&s).ok()?;
+    if data.len() != n {
         return None;
+    }
+    if invert {
+        data.iter_mut().for_each(|v| *v = 255 - *v);
     }
     let mut pix = Pix { w, h, gray: true, data };
     whiten(&mut pix, ctm, rects, false); // 255 = opaque
+    if invert {
+        pix.data.iter_mut().for_each(|v| *v = 255 - *v);
+    }
     let mut d = s.dict.clone();
     d.remove(b"Filter");
     d.remove(b"DecodeParms");

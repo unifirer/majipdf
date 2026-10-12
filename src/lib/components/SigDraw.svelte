@@ -79,7 +79,7 @@
       const it = await sigAddDrawn(cv.toDataURL("image/png"), name.trim() || t("sigKindSig"));
       await refreshSigs();
       e.drawOpen = false;
-      pickSig(it); // ready to place
+      if (e.doc) pickSig(it); // ready to place (only inside an open editor; Settings just saves it)
     } catch (x) {
       err = String(x);
     } finally {

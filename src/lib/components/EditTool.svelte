@@ -17,7 +17,6 @@
   import EditPage from "./EditPage.svelte";
   import FormatPanel from "./FormatPanel.svelte";
   import SigPopover from "./SigPopover.svelte";
-  import SigDraw from "./SigDraw.svelte";
   import WatermarkPanel from "./WatermarkPanel.svelte";
   import HeaderFooterPanel from "./HeaderFooterPanel.svelte";
 
@@ -76,7 +75,7 @@
   });
 
   const scanNote = $derived(!!file?.scanned || Object.values(e.models).some((m) => m.scan));
-  const canSave = $derived(ready && e.hist.count > 0 && !e.busy && !e.editing?.applying);
+  const canSave = $derived(ready && e.hist.count > 0 && !e.busy && !e.saving && !e.editing?.applying);
 
   function onrun() {
     if (file.signed) signedOpen = true;
@@ -109,6 +108,7 @@
   // when no editor (or other field) has focus.
   function onkeydown(ev: KeyboardEvent) {
     if (e.drawOpen || e.leaveAsk || signedOpen) return; // the modal / dialog owns the keys
+    if (e.saving) return ev.preventDefault(); // Save is flushing: nothing may change
     if (ev.key === "Escape") {
       if (e.editing) {
         ev.preventDefault();
@@ -213,9 +213,6 @@
   />
 {/if}
 
-{#if e.drawOpen}
-  <SigDraw />
-{/if}
 {#if e.sigOpen && sigBtn}
   <SigPopover anchor={sigBtn} />
 {/if}
@@ -250,7 +247,7 @@
 
 {#snippet main()}
   {#if ready}
-    <div style="flex:1;min-height:0;display:flex">
+    <div inert={e.saving} style="flex:1;min-height:0;display:flex">
       <nav
         bind:this={rail}
         aria-label={t("pages")}
@@ -372,6 +369,7 @@
 
 {#snippet options()}
   {#if ready}
+   <div inert={e.saving} style="display:contents">
     {#if e.panel === "wm"}
       <WatermarkPanel />
     {:else if e.panel === "hf"}
@@ -417,6 +415,7 @@
         </div>
       </div>
     {/if}
+   </div>
   {/if}
 {/snippet}
 

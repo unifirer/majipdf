@@ -464,6 +464,21 @@
     document.execCommand("insertText", false, s);
   }
 
+  // Dropped content is inserted as plain text only (like paste); dragging the editor text itself is off.
+  function ondrop(ev: DragEvent) {
+    ev.preventDefault();
+    let s = ev.dataTransfer?.getData("text/plain") ?? "";
+    if (!s || !ta) return;
+    const r = document.caretRangeFromPoint?.(ev.clientX, ev.clientY);
+    if (r && ta.contains(r.startContainer)) {
+      const g = getSelection();
+      g?.removeAllRanges();
+      g?.addRange(r);
+    }
+    if (e.editing?.kind !== "box") s = s.replace(/\s*[\r\n]+\s*/g, " ");
+    document.execCommand("insertText", false, s);
+  }
+
   const btn = "min-height:32px;padding:0 12px;border-radius:8px;border:1px solid var(--line2);background:var(--surface);color:var(--text);font-size:14px;cursor:pointer;white-space:nowrap";
   const btnPrimary = "min-height:32px;padding:0 12px;border-radius:8px;border:0;background:var(--accent-fill);color:var(--accent-ink);font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap";
 </script>
@@ -606,6 +621,8 @@
         {oninput}
         {onkeydown}
         {onpaste}
+        {ondrop}
+        ondragstart={(ev) => ev.preventDefault()}
         spellcheck="false"
         aria-label={t("editName")}
         style="display:block;box-sizing:border-box;margin:0;padding:0;border:0;white-space:pre-wrap;overflow-wrap:anywhere;outline:2px solid var(--accent);outline-offset:2px;background:#FFF1E6;color:#000;caret-color:#000;width:{tw}px;min-height:{th}px;font-family:{fontOf(p.font)};font-size:{p.size * scale}px;line-height:{p.pitch * scale}px;text-align:{p.align === 'justified' ? 'justify' : p.align};text-indent:{p.indent * scale}px;opacity:{ed.applying ? 0.7 : 1}"
@@ -633,10 +650,11 @@
       style="position:fixed;z-index:30;left:{barPos.left}px;top:{barPos.top}px;visibility:{barPos.ready ? 'visible' : 'hidden'};box-sizing:border-box;width:{barW}px;max-width:calc(100vw - 16px);padding:10px 12px;border-radius:10px;background:{!b || b.kind === 'missing' || b.kind === 'cannot_push' || b.kind === 'overflow' ? 'var(--warn-soft)' : 'var(--err-soft)'};color:var(--text);font-size:14px;line-height:1.4;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:8px;overflow-wrap:anywhere;text-align:left;text-indent:0;font-weight:400;font-style:normal;text-align-last:auto"
     >
       {#if !b}
-        <div>{t("editWoPartial")}</div>
+        <div>{e.woBar?.batch ? t("editRmPartial") : t("editWoPartial")}</div>
+        {#if e.woBar?.annots}<div>{t("editWoAnnots", { n: e.woBar.annots })}</div>{/if}
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button style={btnPrimary} onclick={coverOnly}>{t("editWoCover")}</button>
-          <button style={btn} onclick={dismissWo}>{t("editWoUndo")}</button>
+          <button style={btn} onclick={dismissWo}>{e.woBar?.batch ? t("cancel") : t("editWoUndo")}</button>
         </div>
       {:else}
       <div>

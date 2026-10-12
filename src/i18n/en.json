@@ -329,7 +329,7 @@
   "editHintAdd": "Click on the page where the new text should go.",
   "editHintWo": "Drag a box over what you want removed. Text and images under it are really removed, not just covered.",
   "editHintSig": "Pick a signature or stamp, then click on the page to place it.",
-  "editWoPartial": "Some text under this box is part of a repeated element and can't be removed, only covered. It could still be copied from the PDF.",
+  "editWoPartial": "Some content under this box can't be removed, only covered with a white box. The original stays inside the file, and someone with a PDF editor could still recover it.",
   "editWoCover": "Cover only",
   "editWoUndo": "Remove white-out",
   "sigImport": "Import image…",
@@ -411,5 +411,12 @@
   "hfTooLong": "This text is too long to fit across the page. Shorten it.",
   "wmEmpty": "Type the watermark text first.",
   "hfDateId": "date (ID)",
-  "hfDateEn": "date (EN)"
+  "hfDateEn": "date (EN)",
+  "sigClearAll": "Delete all",
+  "sigClearAsk": "Delete all saved signatures and stamps from this computer? Places where you already used them stay as they are.",
+  "editRmPartial": "Part of this item can't be removed, only covered with a white box. The original stays inside the file, and someone with a PDF editor could still recover it.",
+  "editWoAnnots": "{n} comments or form fields here are only partly covered and will stay in the file.",
+  "setSigs": "Saved signatures & stamps",
+  "setSigsCount": "{n} saved",
+  "setSigsManage": "Manage…"
 }

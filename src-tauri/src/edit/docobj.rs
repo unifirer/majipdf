@@ -113,7 +113,7 @@ fn uniq(s: &str) -> String {
 /// The embedded PC face for a family: its resource name and widths (1/1000 em per WinAnsi code).
 fn face(doc: &mut Document, acc: &mut Acc, fam: &str, bold: bool, italic: bool, add: &mut DocAdd) -> Result<(String, [f64; 256]), BErr> {
     let st = acc.pcs.style_fam(fam, bold, italic, 1.0, "0 g").map_err(fail)?;
-    let fi = st.font.trim_start_matches("MjF").parse::<usize>().unwrap_or(1) - 1;
+    let fi = acc.pcs.index_of(&st.font);
     let id = *acc.pc_objs.entry(fi).or_insert_with(|| embed_pc(doc, &acc.pcs.faces[fi].1));
     if !add.fonts.iter().any(|f| f.0 == st.font) {
         add.fonts.push((st.font.clone(), id));
@@ -123,7 +123,7 @@ fn face(doc: &mut Document, acc: &mut Acc, fam: &str, bold: bool, italic: bool, 
 
 /// Ascent of a PC face in em (what a baseline hangs below the top margin).
 fn ascent(acc: &Acc, font: &str) -> f64 {
-    let fi = font.trim_start_matches("MjF").parse::<usize>().unwrap_or(1) - 1;
+    let fi = acc.pcs.index_of(font);
     let pc = &acc.pcs.faces[fi].1;
     ttf_parser::Face::parse(&pc.bytes, 0).map(|f| f.ascender() as f64 / f.units_per_em() as f64).unwrap_or(0.9)
 }
@@ -153,7 +153,7 @@ fn gs_for(doc: &mut Document, acc: &mut Acc, add: &mut DocAdd, opacity: f64) -> 
     let (name, id) = match acc.gs.get(&key) {
         Some(v) => v.clone(),
         None => {
-            let name = format!("MjGs{}", acc.gs.len() + 1);
+            let name = format!("MjGs{}", acc.base + acc.gs.len() + 1);
             let o = Object::Real((key as f64 / 1000.0) as f32);
             let mut d = Dictionary::new();
             d.set("Type", "ExtGState");
@@ -195,7 +195,7 @@ fn wm_bytes(doc: &mut Document, acc: &mut Acc, sh: &Shared, g: &Geom, w: &WmE, a
         if !acc.asset_objs.contains_key(&w.asset) {
             let n = acc.asset_objs.len() + 1;
             let id = png_xobject(doc, png).map_err(BErr::Other)?;
-            acc.asset_objs.insert(w.asset.clone(), (format!("MjSg{n}"), id));
+            acc.asset_objs.insert(w.asset.clone(), (format!("MjSg{}", acc.base + n), id));
         }
         let (name, id) = acc.asset_objs[&w.asset].clone();
         if !add.xs.iter().any(|x| x.0 == name) {

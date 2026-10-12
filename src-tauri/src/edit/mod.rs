@@ -3,9 +3,11 @@
 //! Edits are data and the output is a pure function of (original bytes, effective edits); undo/redo only moves a cursor.
 mod build;
 mod content;
+mod decode;
 mod docobj;
 mod fonts;
 mod layout;
+mod scrub;
 pub mod sig;
 mod whiteout;
 
@@ -151,7 +153,7 @@ pub enum ObjRes {
     Ok { page: PageModel, id: u32 },
     MissingChars { chars: String },
     UnsupportedChars { chars: String },
-    WhiteoutPartial { chars: usize },
+    WhiteoutPartial { chars: usize, annots: usize },
 }
 
 #[derive(Serialize, Debug)]
@@ -207,7 +209,12 @@ pub struct ItemRef {
 pub enum ObjEdit3 {
     Move { page: u32, item: ItemRef, dx: f64, dy: f64 },
     Resize { page: u32, item: ItemRef, rect: [f64; 4] },
-    Remove { page: u32, item: ItemRef },
+    Remove {
+        page: u32,
+        item: ItemRef,
+        #[serde(default)]
+        cover_only: bool, // accept a partial removal (what could not be proven gone stays)
+    },
 }
 
 #[derive(Deserialize, Debug)]
@@ -220,6 +227,7 @@ pub struct EditBatchReq {
 pub enum BatchRes {
     Ok { pages: Vec<PageModel> },
     CannotMove { page: u32, item: ItemRef },
+    RemovePartial { page: u32, item: ItemRef, annots: usize },
 }
 
 fn d_margin() -> f64 {
@@ -348,6 +356,7 @@ pub struct PItem {
 
 pub struct PageAn {
     idx: u32,
+    broken: bool, // content over the size / op budget: analysis incomplete, the page must not be rewritten
     pid: ObjectId,
     page: [f64; 4],
     scan: bool,
@@ -367,6 +376,7 @@ pub struct PageAn {
     q: i64, // extra turn of the work frame, degrees
     form_segs: Vec<Seg>,   // text inside form XObjects (work frame): can only be covered
     form_imgs: Vec<[f64; 4]>, // images inside form XObjects (work frame x0 y0 x1 y1)
+    form_over: bool, // too much form text to measure: white-outs on this page are partial
     items: Vec<PItem>,
 }
 
@@ -418,10 +428,20 @@ fn display_matrix(b: [f64; 4], rot: i64) -> content::M {
     content::mul(content::tr(-b[0], -b[1]), r)
 }
 
-fn walk(o: &PdfPageObject, form: bool, direct: &mut Vec<String>, forms: &mut Vec<Seg>, imgs: &mut Vec<[f64; 4]>, paths: &mut Vec<[f64; 4]>) {
+/// Walks pdfium's page objects. `PdfPageTextObject::text()` loads the page's text layer on every call, so it is only asked for
+/// where a show op has codes we could not decode (`need`), and form text is capped: past FORM_TEXT_MAX objects the page is
+/// `form_over` (every white-out on it is then partial) instead of quadratic.
+const FORM_TEXT_MAX: usize = 1500;
+
+fn walk(o: &PdfPageObject, form: bool, need: &[bool], form_over: &mut bool, direct: &mut Vec<String>, forms: &mut Vec<Seg>, imgs: &mut Vec<[f64; 4]>, paths: &mut Vec<[f64; 4]>) {
     if let Some(t) = o.as_text_object() {
         if !form {
-            direct.push(t.text());
+            let k = direct.len();
+            direct.push(if need.get(k).copied().unwrap_or(false) { t.text() } else { String::new() });
+            return;
+        }
+        if forms.len() >= FORM_TEXT_MAX {
+            *form_over = true;
             return;
         }
         let text = t.text();
@@ -448,10 +468,31 @@ fn walk(o: &PdfPageObject, form: bool, direct: &mut Vec<String>, forms: &mut Vec
         }
     } else if let Some(x) = o.as_x_object_form_object() {
         for c in x.iter() {
-            walk(&c, true, direct, forms, imgs, paths);
+            walk(&c, true, need, form_over, direct, forms, imgs, paths);
         }
     }
 }
+
+/// Highest number among our own resource names (MjF3, MjSg2, MjWo1, MjGs1) in the document: new names start after it.
+fn name_base(doc: &Document) -> usize {
+    let num_of = |k: &[u8]| -> usize {
+        let s = String::from_utf8_lossy(k);
+        ["MjF", "MjSg", "MjWo", "MjGs"].iter().find_map(|p| s.strip_prefix(p).and_then(|n| n.parse::<usize>().ok())).unwrap_or(0)
+    };
+    let mut m = 0;
+    for pid in doc.page_iter() {
+        let Some(res) = effective_resources(doc, pid) else { continue };
+        for key in ["Font", "XObject", "ExtGState"] {
+            if let Some(d) = res.get(key.as_bytes()).ok().and_then(|o| deref(doc, o).as_dict().ok()) {
+                m = d.iter().fold(m, |a, (k, _)| a.max(num_of(k)));
+            }
+        }
+    }
+    m
+}
+
+/// More show ops than this on one page: the page is locked, not analysed paragraph by paragraph.
+const MAX_SHOWS: usize = 50_000;
 
 fn xobj_is_image(doc: &Document, page: ObjectId, name: &str) -> bool {
     let Some(xo) = effective_resources(doc, page).and_then(|r| r.get(b"XObject").ok()).and_then(|o| deref(doc, o).as_dict().ok()) else { return false };
@@ -507,7 +548,7 @@ fn page_items(doc: &Document, pid: ObjectId, joined: &[u8], an: &Analysis, form_
 
 fn do_name(joined: &[u8], o: &content::Op) -> Option<String> {
     let t = String::from_utf8_lossy(&joined[o.s..o.e]).to_string();
-    Some(t.trim().strip_prefix('/')?.split_whitespace().next()?.to_string())
+    Some(content::decode_name(t.trim().strip_prefix('/')?.split_whitespace().next()?.as_bytes()))
 }
 
 fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String> {
@@ -520,7 +561,11 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
     let mut page = [0.0, 0.0, disp[0], disp[1]];
     let mut to_disp = content::ID;
     let fonts = load_fonts(doc, pid);
-    let joined = doc.get_page_content(pid).map_err(|e| e.to_string())?;
+    // a stream that inflates past the cap is not read: the page is locked and never rewritten
+    let (joined, over_cap) = match fonts::page_content(doc, pid) {
+        Ok(j) => (j, false),
+        Err(_) => (vec![], true),
+    };
     let mut an = content::analyse_with(&joined, &fonts, &|n| xobj_box(doc, pid, n), rmat);
     let q = dominant_turn(&an);
     if q != 0 {
@@ -533,13 +578,18 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
         an = content::analyse_with(&joined, &fonts, &|n| xobj_box(doc, pid, n), rmat);
     }
     // pdfium side: text objects for the 1:1 check and undecodable codes, form text, image coverage
-    let (direct, forms, form_imgs, form_paths, coverage) = {
+        let need: Vec<bool> = an.shows.iter().map(|s| s.glyphs.iter().any(|g| g.text.is_none())).collect();
+    let too_many = an.shows.len() > MAX_SHOWS;
+    let mut form_over = too_many; // too many text objects: nothing is measured, every white-out on the page is partial
+    let (direct, forms, form_imgs, form_paths, coverage) = if over_cap || an.overflow || too_many {
+        (vec![], vec![], vec![], vec![], 0.0)
+    } else {
         let p = pdf::pdfium()?;
         let d = p.load_pdf_from_byte_vec(orig.to_vec(), None).map_err(|e| e.to_string())?;
         let pg = d.pages().get(idx as PdfPageIndex).map_err(|e| e.to_string())?;
         let (mut direct, mut forms, mut imgs, mut paths) = (vec![], vec![], vec![], vec![]);
         for o in pg.objects().iter() {
-            walk(&o, false, &mut direct, &mut forms, &mut imgs, &mut paths);
+            walk(&o, false, &need, &mut form_over, &mut direct, &mut forms, &mut imgs, &mut paths);
         }
         (direct, forms, imgs, paths, pdf::image_coverage(&pg))
     };
@@ -562,8 +612,11 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
     let form_imgs: Vec<[f64; 4]> = form_imgs.into_iter().map(to_work).collect();
     let form_paths: Vec<[f64; 4]> = form_paths.into_iter().map(to_work).collect();
     let form_segs = forms.clone();
+    let broken = over_cap || an.overflow || too_many;
     let lock_all = if rot % 90 != 0 {
         Some("rotated")
+    } else if broken {
+        Some("structure")
     } else if direct.len() != an.shows.len() {
         Some("structure")
     } else {
@@ -582,16 +635,16 @@ fn analyse_page(doc: &Document, orig: &[u8], idx: u32) -> Result<PageAn, String>
             }
         }
     }
-    let (mut paras, pitch) = find_paras(&PageIn { shows: &an.shows, fonts: &fonts, forms, page });
+        let (mut paras, pitch) = find_paras(&PageIn { shows: &an.shows, fonts: &fonts, forms, page });
     if let Some(r) = lock_all {
         for p in paras.iter_mut() {
             p.locked = Some(r);
             p.ed = None;
         }
     }
-    let (foot_y, head_y) = zones(&an, page, pitch);
-    let items = page_items(doc, pid, &joined, &an, &form_imgs, &form_paths, lock_all);
-    Ok(PageAn { idx, items, form_segs, form_imgs, pid, page, lock: lock_all, pdfium_texts: direct.len(), scan: coverage >= pdf::IMAGE_DOMINANT_PCT, joined, an, fonts, paras, foot_y, head_y, rinv: content::inv(rmat).unwrap_or(content::ID), disp, to_disp, q })
+        let (foot_y, head_y) = zones(&an, page, pitch);
+        let items = page_items(doc, pid, &joined, &an, &form_imgs, &form_paths, lock_all);
+    Ok(PageAn { idx, broken, form_over, items, form_segs, form_imgs, pid, page, lock: lock_all, pdfium_texts: direct.len(), scan: coverage >= pdf::IMAGE_DOMINANT_PCT, joined, an, fonts, paras, foot_y, head_y, rinv: content::inv(rmat).unwrap_or(content::ID), disp, to_disp, q })
 }
 
 // ---------------- edits and building ----------------
@@ -642,11 +695,12 @@ struct MvE {
     dy: f64,
     rect: Option<[f64; 4]>,
     removed: bool,
+    cover: bool, // a removal the user accepted although something could not be proven gone
 }
 
 impl MvE {
     fn new(page: u32, kind: IKind, id: u32) -> MvE {
-        MvE { page, kind, id, dx: 0.0, dy: 0.0, rect: None, removed: false }
+        MvE { page, kind, id, dx: 0.0, dy: 0.0, rect: None, removed: false, cover: false }
     }
     fn is_identity(&self) -> bool {
         self.dx.abs() < 1e-9 && self.dy.abs() < 1e-9 && self.rect.is_none() && !self.removed
@@ -725,7 +779,8 @@ enum BErr {
     Unsupported(String),
     Overflow(u32),
     CannotPush,
-    Partial(usize),
+    Partial(usize, usize), // characters, annotations
+    RemovePartial(u32, IKind, u32, usize),
     CannotMove(u32, IKind, u32), // page, item
     BadPages(String),
     TooLong,
@@ -753,6 +808,7 @@ struct PageInfo {
 }
 
 struct Built {
+    ok_images: HashSet<ObjectId>, // image objects a white-out may leave under its rect: sanitised ones and our own placed assets
     bytes: Vec<u8>,
     info: HashMap<u32, PageInfo>,
     pc_used: bool,
@@ -783,6 +839,7 @@ struct Session {
     used: Option<Arc<HashMap<ObjectId, HashSet<u32>>>>,
     floor_override: Option<f64>, // tests only
     scan_cache: HashMap<u32, bool>,
+    name_base: usize, // highest Mj* resource number already in the document
     _guard: Option<JobGuard>,
 }
 
@@ -828,8 +885,9 @@ impl Session {
             let v = d.pages().iter().map(|pg| (pg.width().value, pg.height().value)).collect();
             v
         };
+        let name_base = name_base(&doc);
         let edoc = EditDoc { pages: sizes.len() as u32, sizes: sizes.clone() };
-        let s = Session { orig, doc, path: path.to_path_buf(), sizes, pages: HashMap::new(), hist: vec![], cursor: 0, assets: HashMap::new(), next_id: 0, lib_dir: None, built: None, used: None, floor_override: None, scan_cache: HashMap::new(), _guard: guard };
+        let s = Session { orig, doc, path: path.to_path_buf(), sizes, pages: HashMap::new(), hist: vec![], cursor: 0, assets: HashMap::new(), next_id: 0, lib_dir: None, built: None, used: None, floor_override: None, scan_cache: HashMap::new(), name_base, _guard: guard };
         Ok((s, edoc))
     }
 
@@ -879,7 +937,7 @@ impl Session {
     fn build<T: Into<Item> + Clone>(&mut self, edits: &[T]) -> Result<Built, BErr> {
         let items: Vec<Item> = edits.iter().cloned().map(Into::into).collect();
         if items.is_empty() {
-            return Ok(Built { bytes: self.orig.clone(), info: HashMap::new(), pc_used: false });
+            return Ok(Built { bytes: self.orig.clone(), info: HashMap::new(), pc_used: false, ok_images: HashSet::new() });
         }
         if self.used.is_none() {
             self.used = Some(Arc::new(used_codes(&self.doc)));
@@ -920,7 +978,8 @@ impl Session {
         pages.extend(hfs.iter().flat_map(|h| h.pages.iter().copied()));
         let mut doc = self.doc.clone();
         let pids = doc.get_pages();
-        let mut acc = build::Acc::default();
+        let mut acc = build::Acc { base: self.name_base, ..Default::default() };
+        acc.pcs.base = self.name_base;
         let mut info = HashMap::new();
         let assets = self.assets.clone();
         for pg in pages {
@@ -938,6 +997,15 @@ impl Session {
                 None => {}
             }
         }
+        // removal beyond the page streams: alternate text, resources that would keep a removed image reachable
+        let alt: HashSet<ObjectId> = acc.alt_pages.iter().copied().collect();
+        if !alt.is_empty() {
+            scrub::strip_alt(&mut doc, &alt);
+        }
+        if !acc.rm_names.is_empty() {
+            scrub::detach_removed(&self.doc, &mut doc, &acc.rm_names);
+            acc.prune = true;
+        }
         let live: HashSet<ObjectId> = doc.page_iter().flat_map(|p| doc.get_page_contents(p)).collect();
         for id in acc.old.into_iter().filter(|i| !live.contains(i)) {
             doc.objects.remove(&id);
@@ -947,7 +1015,8 @@ impl Session {
         }
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).map_err(|e| BErr::Other(e.to_string()))?;
-        Ok(Built { bytes, info, pc_used: !acc.pc_objs.is_empty() })
+        let ok_images: HashSet<ObjectId> = acc.sanitised.iter().copied().chain(acc.asset_objs.values().map(|v| v.1)).collect();
+        Ok(Built { bytes, info, pc_used: !acc.pc_objs.is_empty(), ok_images })
     }
 
     fn built(&mut self) -> Result<Arc<Built>, String> {
@@ -1148,7 +1217,7 @@ impl Session {
             Err(BErr::Unsupported(chars)) => Ok(EditApplyRes::UnsupportedChars { chars }),
             Err(BErr::Overflow(n)) => Ok(EditApplyRes::Overflow { lines_over: n }),
             Err(BErr::CannotPush) => Ok(EditApplyRes::CannotPush),
-            Err(BErr::Partial(_)) | Err(BErr::CannotMove(..)) | Err(BErr::BadPages(_)) | Err(BErr::TooLong) => Err("unexpected result".into()),
+            Err(BErr::Partial(..)) | Err(BErr::RemovePartial(..)) | Err(BErr::CannotMove(..)) | Err(BErr::BadPages(_)) | Err(BErr::TooLong) => Err("unexpected result".into()),
             Err(BErr::Other(s)) => Err(s),
         }
     }
@@ -1237,7 +1306,7 @@ impl Session {
             }
             Err(BErr::Missing(chars)) => Ok(ObjRes::MissingChars { chars }),
             Err(BErr::Unsupported(chars)) => Ok(ObjRes::UnsupportedChars { chars }),
-            Err(BErr::Partial(chars)) => Ok(ObjRes::WhiteoutPartial { chars }),
+            Err(BErr::Partial(chars, annots)) => Ok(ObjRes::WhiteoutPartial { chars, annots }),
             Err(BErr::Other(s)) => Err(s),
             Err(_) => Err("cannot place the object".into()),
         }
@@ -1259,7 +1328,7 @@ impl Session {
         let mut pages: BTreeSet<u32> = BTreeSet::new();
         for e in &req.edits {
             let (page, item) = match e {
-                ObjEdit3::Move { page, item, .. } | ObjEdit3::Resize { page, item, .. } | ObjEdit3::Remove { page, item } => (*page, *item),
+                ObjEdit3::Move { page, item, .. } | ObjEdit3::Resize { page, item, .. } | ObjEdit3::Remove { page, item, .. } => (*page, *item),
             };
             let pa = self.page(page)?;
             let (exists, locked, orig) = match item.kind {
@@ -1296,7 +1365,10 @@ impl Session {
                     let (sx, sy) = self.push_shift(page, item.kind, item.id)?;
                     mv.rect = Some([rect[0] - sx, rect[1] - sy, rect[2].max(1.0), rect[3].max(1.0)]);
                 }
-                ObjEdit3::Remove { .. } => mv.removed = true,
+                ObjEdit3::Remove { cover_only, .. } => {
+                    mv.removed = true;
+                    mv.cover = *cover_only;
+                }
             }
             match cur.iter().position(same) {
                 Some(i) => cur[i] = Item::Mv(mv.clone()),
@@ -1316,6 +1388,7 @@ impl Session {
                 Ok(BatchRes::Ok { pages })
             }
             Err(BErr::CannotMove(page, kind, id)) => Ok(BatchRes::CannotMove { page, item: ItemRef { kind, id } }),
+            Err(BErr::RemovePartial(page, kind, id, annots)) => Ok(BatchRes::RemovePartial { page, item: ItemRef { kind, id }, annots }),
             Err(BErr::Other(s)) => Err(s),
             Err(_) => Err("cannot apply the change".into()),
         }
@@ -1580,7 +1653,7 @@ fn canon(runs: &[Run]) -> Vec<(char, Fmt)> {
 /// The format of a layout style: orig font resources are "orig", PC faces their family.
 fn fmt_of_style(fonts: &BTreeMap<String, Fnt>, pcs: Option<&PcSet>, align: Align, st: &layout::Style) -> Fmt {
     let (font, bold, italic) = match st.font.strip_prefix("MjF").and_then(|n| n.parse::<usize>().ok()) {
-        Some(i) => pcs.and_then(|p| p.faces.get(i.wrapping_sub(1))).map(|(k, _)| (layout::pc_family_name(&k.0), k.1, k.2)).unwrap_or(("Arial".into(), false, false)),
+        Some(_) => pcs.and_then(|p| p.faces.get(p.index_of(&st.font))).map(|(k, _)| (layout::pc_family_name(&k.0), k.1, k.2)).unwrap_or(("Arial".into(), false, false)),
         None => {
             let f = fonts.get(&st.font);
             ("orig".into(), f.is_some_and(|f| f.bold), f.is_some_and(|f| f.italic))
@@ -1673,6 +1746,60 @@ fn text_of_page(bytes: &[u8], pg: u32) -> String {
     let Ok(p) = pdf::pdfium() else { return String::new() };
     let Ok(d) = p.load_pdf_from_byte_vec(bytes.to_vec(), None) else { return String::new() };
     d.pages().get(pg as PdfPageIndex).ok().and_then(|pg| pg.text().ok().map(|t| t.all())).unwrap_or_default()
+}
+
+/// Checks the BUILT document (before any gs pass renumbers objects) for what a white-out must have removed:
+/// every image under a white-out is a sanitised object or one of our own placed images, no annotation is under it, and the pages that
+/// lost content carry no alternate text. Any failure is "verify".
+fn verify_removed(bytes: &[u8], wos: &[(u32, [f64; 4])], ok: &HashSet<ObjectId>, destructive: &HashSet<u32>) -> Result<(), String> {
+    let bad = || "verify".to_string();
+    let doc = Document::load_mem(bytes).map_err(|_| bad())?;
+    let pids = doc.get_pages();
+    for (pg, r) in wos {
+        let pid = *pids.get(&(pg + 1)).ok_or_else(bad)?;
+        let g = docobj::geom(&doc, pid);
+        let joined = fonts::page_content(&doc, pid).map_err(|_| bad())?;
+        let an = content::analyse_with(&joined, &BTreeMap::new(), &|n| xobj_box(&doc, pid, n), inv_m(g.d2u));
+        if an.overflow {
+            return Err(bad());
+        }
+        let wr = [r[0], g.disp[1] - r[1] - r[3], r[0] + r[2], g.disp[1] - r[1]]; // display, y up
+        let xo = effective_resources(&doc, pid).and_then(|x| x.get(b"XObject").ok()).and_then(|o| deref(&doc, o).as_dict().ok());
+        for o in &an.ops {
+            let Some(b) = o.bbox else { continue };
+            // a half point of slack: edges that only touch are not "under" the rect
+            if !(b[0] < wr[2] - 0.5 && wr[0] + 0.5 < b[2] && b[1] < wr[3] - 0.5 && wr[1] + 0.5 < b[3]) {
+                continue;
+            }
+            match o.k {
+                OK::Do => {
+                    let id = do_name(&joined, o).and_then(|n| xo?.get(n.as_bytes()).ok()?.as_reference().ok());
+                    let is_img = id.and_then(|i| doc.get_object(i).ok()).is_some_and(|x| matches!(x, Object::Stream(s) if s.dict.get(b"Subtype").ok().and_then(|t| t.as_name().ok()) == Some(b"Image")));
+                    if id.is_none() && do_name(&joined, o).is_some() || is_img && !ok.contains(&id.unwrap()) {
+                        return Err(bad());
+                    }
+                }
+                OK::Paint if content::op_name(&joined, o) == "BI" => return Err(bad()),
+                _ => {}
+            }
+        }
+        let u = {
+            let m = g.d2u;
+            let pts = [(wr[0], wr[1]), (wr[2], wr[1]), (wr[2], wr[3]), (wr[0], wr[3])].map(|(x, y)| (x * m[0] + y * m[2] + m[4], x * m[1] + y * m[3] + m[5]));
+            [pts.iter().map(|p| p.0).fold(f64::MAX, f64::min), pts.iter().map(|p| p.1).fold(f64::MAX, f64::min), pts.iter().map(|p| p.0).fold(f64::MIN, f64::max), pts.iter().map(|p| p.1).fold(f64::MIN, f64::max)]
+        };
+        let (inside, partial) = scrub::find_annots(&doc, pid, &[u]);
+        if !inside.is_empty() || partial > 0 {
+            return Err(bad());
+        }
+    }
+    for pg in destructive {
+        let pid = *pids.get(&(pg + 1)).ok_or_else(bad)?;
+        if scrub::alt_left(&doc, &HashSet::from([pid])) > 0 {
+            return Err(bad());
+        }
+    }
+    Ok(())
 }
 
 fn chars_of(s: &str) -> HashMap<char, usize> {
@@ -1797,6 +1924,18 @@ impl Session {
                 gone.push((pg, want, n));
             }
         }
+        // what a destructive edit must have cleaned: white-outs the user did not downgrade to "cover only", and the pages they touch
+        let wo_all: Vec<(u32, [f64; 4])> = edits.iter().filter_map(|x| if let Item::Obj(o) = x { (o.kind == ObjKind::WhiteOut && !o.cover_only).then_some((o.page, o.rect)) } else { None }).collect();
+        let destructive: HashSet<u32> = edits
+            .iter()
+            .filter_map(|x| match x {
+                Item::Obj(o) if o.kind == ObjKind::WhiteOut && !o.cover_only => Some(o.page),
+                Item::Mv(m) if m.removed => Some(m.page),
+                Item::Para(e) => Some(e.page),
+                _ => None,
+            })
+            .collect();
+        verify_removed(&b.bytes, &wo_all, &b.ok_images, &destructive)?;
         let hit = |a: [f64; 4], c: [f64; 4]| a[0] < c[0] + c[2] && c[0] < a[0] + a[2] && a[1] < c[1] + c[3] && c[1] < a[1] + a[3];
         for (i, it) in edits.iter().enumerate() {
             if matches!(it, Item::Para(e) if removed.contains(&(e.page, e.para))) {
@@ -1857,9 +1996,20 @@ impl Session {
 
 #[tauri::command]
 pub async fn edit_open(req: EditOpenReq) -> Result<EditDoc, String> {
-    drop(SESSION.lock().unwrap_or_else(|e| e.into_inner()).take()); // replaces any earlier session and frees its job slot
-    let guard = crate::job::begin()?;
     tauri::async_runtime::spawn_blocking(move || {
+        // claim the job slot first: if another job is running, the session we have stays untouched
+        let mut old = SESSION.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(o) = old.as_mut() {
+            drop(o._guard.take()); // the old session's own slot
+        }
+        let guard = match crate::job::begin() {
+            Ok(g) => g,
+            Err(e) => {
+                *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = old;
+                return Err(e);
+            }
+        };
+        drop(old);
         let pw = req.password.as_deref().filter(|p| !p.is_empty());
         let (s, d) = Session::open(Path::new(&req.path), pw, Some(guard))?;
         *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
@@ -1949,8 +2099,9 @@ pub async fn edit_save(app: tauri::AppHandle, req: EditSaveReq) -> Result<EditSa
 
 /// No-op when there is no session.
 #[tauri::command]
-pub fn edit_close() {
-    drop(SESSION.lock().unwrap_or_else(|e| e.into_inner()).take());
+pub async fn edit_close() -> Result<(), String> {
+    // on a worker: a save in progress holds the session lock for a long time, and the main thread must not wait for it
+    tauri::async_runtime::spawn_blocking(|| drop(SESSION.lock().unwrap_or_else(|e| e.into_inner()).take())).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

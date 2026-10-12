@@ -17,7 +17,7 @@ export type ObjRes =
   | { kind: "ok"; page: PageModel; id: number }
   | { kind: "missing_chars"; chars: string }
   | { kind: "unsupported_chars"; chars: string }
-  | { kind: "whiteout_partial"; chars: number };
+  | { kind: "whiteout_partial"; chars: number; annots?: number };
 export interface SigItem { id: string; name: string; kind: "signature" | "stamp"; w: number; h: number; data_url: string }
 
 export interface EditOpenReq { path: string; password: string | null }
@@ -51,13 +51,14 @@ export interface Item extends ItemRef { bbox: Rect; rot: number; locked: string 
 export type ObjEdit3 =
   | { kind: "move"; page: number; item: ItemRef; dx: number; dy: number }
   | { kind: "resize"; page: number; item: ItemRef; rect: Rect }
-  | { kind: "remove"; page: number; item: ItemRef };
-export type BatchRes = { kind: "ok"; pages: PageModel[] } | { kind: "cannot_move"; page: number; item: ItemRef };
+  | { kind: "remove"; page: number; item: ItemRef; cover_only?: boolean };
+export type BatchRes = { kind: "ok"; pages: PageModel[] } | { kind: "cannot_move"; page: number; item: ItemRef } | BatchPartial;
 export type HfPos = "tl" | "tc" | "tr" | "bl" | "bc" | "br";
 export interface WmReq { id: number | null; kind: "text" | "image"; text?: string; style?: Style; asset?: string; scale?: number; opacity: number; angle: number; layer: "behind" | "front"; pages: string }
 export interface HfReq { id: number | null; pos: HfPos; template: string; style: Style; margin_pt: number; start: number; skip_first: boolean; pages: string; lang: "en" | "id"; tz_min: number }
 export type DocRes = { kind: "ok"; id: number; changed: "all" } | { kind: "bad_pages"; reason: string } | { kind: "unsupported_chars"; chars: string } | { kind: "too_long" } | { kind: "bad_text" };
 export interface DocObjs { watermarks: WmReq[]; header_footers: HfReq[] }
+export type BatchPartial = { kind: "remove_partial"; page?: number; annots?: number };
 export interface PageModel { page: number; paras: Para[]; scan: boolean; objs: Obj[]; items: Item[]; wm_forced_front: boolean }
 export interface EditApplyReq { page: number; para: number; text: string; use_pc_font: boolean; allow_overlap: boolean; style?: Style | null; runs?: Run[] | null }
 export type EditApplyRes =
@@ -94,6 +95,7 @@ export const sigList = (): Promise<SigItem[]> => (mock ? mock().then((m) => m.si
 export const sigImport = (path: string, kind: SigItem["kind"]): Promise<SigItem> => (mock ? mock().then((m) => m.sigImport(path, kind)) : invoke("sig_import", { path, kind }));
 export const sigAddDrawn = (dataUrl: string, name: string): Promise<SigItem> => (mock ? mock().then((m) => m.sigAddDrawn(dataUrl, name)) : invoke("sig_add_drawn", { dataUrl, name }));
 export const sigRename = (id: string, name: string): Promise<void> => (mock ? mock().then((m) => m.sigRename(id, name)) : invoke("sig_rename", { id, name }));
+export const sigClear = (): Promise<void> => (mock ? mock().then((m) => m.sigClear()) : invoke("sig_clear"));
 export const sigDelete = (id: string): Promise<void> => (mock ? mock().then((m) => m.sigDelete(id)) : invoke("sig_delete", { id }));
 export const editUndo = (): Promise<EditHistory> => (mock ? mock().then((m) => m.undo()) : invoke("edit_undo"));
 export const editRedo = (): Promise<EditHistory> => (mock ? mock().then((m) => m.redo()) : invoke("edit_redo"));
@@ -109,6 +111,7 @@ let fmtTimer: ReturnType<typeof setTimeout> | 0 = 0;
 const sticky = new Set<string>(); // targets that accepted "Use PC font": it is never asked again this session
 let wmT: ReturnType<typeof setTimeout> | 0 = 0;
 const hfT: Partial<Record<HfPos, ReturnType<typeof setTimeout>>> = {};
+let fmtTg: { page: number; id: number | null } | null = null; // box the pending format change belongs to
 let pend: Partial<Style> = {}; // format patches waiting for the debounce (selected text box, no editor)
 
 const pwOf = (f: FileInfo) => app.compress.passwords[f.path] ?? null;
@@ -133,7 +136,11 @@ function resetState() {
   Object.assign(e.wm, newWm());
   e.hf = newHf();
   clearTimeout(wmT);
-  for (const k of HF_POS) clearTimeout(hfT[k]);
+  wmT = 0;
+  for (const k of HF_POS) {
+    clearTimeout(hfT[k]);
+    hfT[k] = undefined;
+  }
   e.fmt = null;
   e.armed = null;
   e.sigs = [];
@@ -146,6 +153,12 @@ function resetState() {
   fmtTimer = 0;
   sticky.clear();
   pend = {};
+  fmtTg = null;
+  clearTimeout(ndT);
+  ndT = 0;
+  nd = [0, 0];
+  ndTg = null;
+  e.saving = false;
   e.leaveAsk = false;
   e.busy = false;
   e.error = "";
@@ -433,27 +446,31 @@ export function setStyle(patch: Partial<Style>) {
     ed.rev++;
     showFmt();
   } else {
+    if (e.saving) return;
+    if (fmtTg && (fmtTg.page !== f.page || fmtTg.id !== f.id)) void flushFmt(); // never carry a patch over to another box
     pend = { ...pend, ...patch };
+    fmtTg = { page: f.page, id: f.id };
     f.style = { ...f.style, ...patch };
   }
   clearTimeout(fmtTimer);
   fmtTimer = setTimeout(runFmt, 250);
 }
+// The debounced format change is bound to the box it was queued for (not to whatever is selected when it fires).
 async function runFmt() {
   fmtTimer = 0;
-  const f = e.fmt;
-  if (!f) return;
   if (e.busy || e.editing?.applying) {
     fmtTimer = setTimeout(runFmt, 100);
     return;
   }
-  if (e.editing) return void (await applyEditor(false, true));
-  const o = selObj();
-  if (o?.kind !== "textbox") return;
+  if (e.editing) return void (e.fmt ? await applyEditor(false, true) : undefined);
+  const tg = fmtTg;
+  fmtTg = null;
   const patch = pend;
   pend = {};
+  const o = tg && tg.id !== null ? e.models[tg.page]?.objs?.find((x) => x.id === tg.id) : undefined;
+  if (!tg || o?.kind !== "textbox") return;
   const runs = mergeRuns(boxRuns(o).map((r) => ({ text: r.text, style: { ...r.style, ...patch } })));
-  const r = await applyObj({ ...objReq(f.page, o), style: { ...(runs[0]?.style ?? f.style) }, runs });
+  const r = await applyObj({ ...objReq(tg.page, o), style: { ...(runs[0]?.style ?? o.style!) }, runs });
   if (r?.kind === "missing_chars") e.objError = t("editMissing", { c: r.chars });
   else if (r?.kind === "unsupported_chars") e.objError = t("editUnsupported", { c: r.chars });
 }
@@ -469,10 +486,13 @@ async function runObj(req: ObjReq): Promise<ObjRes> {
     e.pgen[req.page] = (e.pgen[req.page] ?? 0) + 1;
     e.dirty = true;
     e.woBar = null;
-    e.sel = req.kind === "delete" ? null : { page: req.page, id: res.id };
+    // a deferred change must not steal the selection from another object
+    const mine = !e.sel || (e.sel.page === req.page && e.sel.id === req.id);
+    if (req.kind === "delete") (e.sel?.page === req.page && e.sel.id === req.id) && (e.sel = null);
+    else if (mine || req.id === null) e.sel = { page: req.page, id: res.id };
     await refreshHistory();
   } else if (res.kind === "whiteout_partial") {
-    e.woBar = { page: req.page, req, rect: req.rect ?? [0, 0, 0, 0] };
+    e.woBar = { page: req.page, req, rect: req.rect ?? [0, 0, 0, 0], annots: res.annots };
   }
   return res;
 }
@@ -495,13 +515,23 @@ export async function applyObj(req: ObjReq): Promise<ObjRes | null> {
 
 export function selectObj(page: number, id: number) {
   if (e.editing) return;
+  if (!(e.sel?.page === page && e.sel.id === id)) flushPendingFor();
   e.isel = null;
   e.sel = { page, id };
   syncFmt();
 }
+// Before the selection changes, pending nudges / format changes are applied to the target they were queued for.
+function flushPendingFor() {
+  void flushNudge();
+  if (fmtTimer && !e.editing) void flushFmt();
+}
+function flushFmt() {
+  clearTimeout(fmtTimer);
+  return runFmt();
+}
 export function clearSel() {
   if (e.editing) return;
-  if (ndT) (clearTimeout(ndT), (ndT = 0), flushNudge()); // arrows pressed just before Esc still apply
+  flushPendingFor();
   e.sel = null;
   e.isel = null;
   syncFmt();
@@ -517,28 +547,70 @@ export function deleteSel() {
 export const addWhiteout = (page: number, rect: Rect) => applyObj({ kind: "whiteout", page, id: null, rect });
 export function coverOnly() {
   const b = e.woBar;
-  if (b) void applyObj({ ...b.req, cover_only: true });
+  if (b?.batch) void runBatch(b.batch.map((x) => (x.kind === "remove" ? { ...x, cover_only: true } : x)));
+  else if (b?.req) void applyObj({ ...b.req, cover_only: true });
 }
 export const dismissWo = () => (e.woBar = null);
 
+// Arrow nudges accumulate for the target they were pressed on (page + object id, or page + item list).
+type NdTarget = { page: number; id?: number; items?: ItemRef[] };
 let nd: [number, number] = [0, 0];
 let ndT: ReturnType<typeof setTimeout> | 0 = 0;
+let ndTg: NdTarget | null = null;
+const sameNd = (a: NdTarget, b: NdTarget) => a.page === b.page && a.id === b.id && JSON.stringify(a.items) === JSON.stringify(b.items);
 export function nudge(dx: number, dy: number) {
-  if ((!selObj() && !e.isel?.items.length) || e.editing) return;
+  if (e.editing || e.saving) return;
+  const tg: NdTarget | null = e.isel?.items.length ? { page: e.isel.page, items: [...e.isel.items] } : e.sel && selObj() ? { page: e.sel.page, id: e.sel.id } : null;
+  if (!tg) return;
+  if (ndTg && !sameNd(ndTg, tg)) void flushNudge(); // another target: A is applied first, with only A's deltas
+  ndTg = tg;
   nd = [nd[0] + dx, nd[1] + dy];
   clearTimeout(ndT);
-  ndT = setTimeout(flushNudge, 180);
+  ndT = setTimeout(() => void flushNudge(), 180);
 }
-function flushNudge() {
-  if (e.busy) {
-    ndT = setTimeout(flushNudge, 100);
-    return;
-  }
-  const o = selObj();
+// Takes the pending nudge synchronously (so a later nudge starts clean), then applies it when the backend is idle.
+function flushNudge(): Promise<void> {
+  clearTimeout(ndT);
+  ndT = 0;
+  const tg = ndTg;
   const [dx, dy] = nd;
   nd = [0, 0];
-  if (e.isel?.items.length) void moveItems(dx, dy);
-  else if (o && e.sel) void moveObj(e.sel.page, o, [o.rect[0] + dx, o.rect[1] + dy, o.rect[2], o.rect[3]]);
+  ndTg = null;
+  if (!tg || (!dx && !dy)) return Promise.resolve();
+  return idle().then(async () => {
+    if (tg.items) await moveItemsOf(tg.page, tg.items, dx, dy);
+    else {
+      const o = e.models[tg.page]?.objs?.find((x) => x.id === tg.id);
+      if (o) await moveObj(tg.page, o, [o.rect[0] + dx, o.rect[1] + dy, o.rect[2], o.rect[3]]);
+    }
+  });
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function idle() {
+  while (e.busy || e.editing?.applying) await sleep(20);
+}
+
+// Everything that is still waiting (debounces, nudge, open editor draft), applied in order. Save calls this first.
+export async function flushAll() {
+  await idle();
+  if (e.editing && !e.editing.bar) await applyEditor();
+  await flushNudge();
+  await idle();
+  if (fmtTimer) await flushFmt();
+  await idle();
+  if (wmT) {
+    clearTimeout(wmT);
+    await runWm();
+  }
+  for (const k of HF_POS) {
+    if (hfT[k]) {
+      clearTimeout(hfT[k]);
+      hfT[k] = undefined;
+      await idle();
+      await runHf(k);
+    }
+  }
+  await idle();
 }
 
 // ---- tools ----
@@ -582,6 +654,8 @@ export async function refreshSigs() {
 }
 
 async function step(fn: () => Promise<EditHistory>) {
+  if (e.busy || e.editing || e.saving) return;
+  await flushAll(); // pending changes land before the undo / redo, in order
   if (e.busy || e.editing) return;
   e.busy = true;
   try {
@@ -605,7 +679,22 @@ export const redo = () => step(editRedo);
 
 export async function startSave() {
   const f = app.tool.files[0];
-  if (!f || e.editing?.bar) return; // an open warning keeps the typed text; resolve it first
+  if (!f || e.editing?.bar || e.saving) return; // an open warning keeps the typed text; resolve it first
+  e.saving = true; // the editor is inert until the save ends
+  e.objError = "";
+  let failed = false;
+  try {
+    await flushAll();
+  } catch (err) {
+    e.objError = String(err);
+    failed = true;
+  }
+  // a flush that ended in an error or a warning bar: show it, keep editing, do not save
+  failed = failed || !!e.objError || !!e.wm.err || HF_POS.some((k) => e.hf.spots[k].err) || !!e.woBar;
+  if (failed || e.editing?.bar) {
+    e.saving = false;
+    return;
+  }
   const r = e.run;
   r.name = f.name;
   r.result = null;
@@ -622,6 +711,8 @@ export async function startSave() {
     if (settled(err)) return;
     r.error = String(err);
     app.tool.phase = "error";
+  } finally {
+    e.saving = false;
   }
 }
 
@@ -645,6 +736,7 @@ const sameItem = (a: ItemRef, b: ItemRef) => a.kind === b.kind && a.id === b.id;
 export const isSelItem = (page: number, it: ItemRef) => e.isel?.page === page && e.isel.items.some((x) => sameItem(x, it));
 export function selectItems(page: number, items: ItemRef[]) {
   if (e.editing) return;
+  flushPendingFor();
   e.sel = null;
   e.isel = items.length ? { page, items: items.map(({ kind, id }) => ({ kind, id })) } : null;
   syncFmt();
@@ -667,10 +759,21 @@ export async function runBatch(edits: ObjEdit3[]): Promise<boolean> {
   e.objError = "";
   try {
     const res = await editApplyBatch(edits);
+    if (res.kind === "remove_partial") {
+      // Select removals that can only cover: same bar as a partial white-out
+      const pg = edits[0].page;
+      const its = (e.models[pg]?.items ?? []).filter((it) => edits.some((x) => x.item.kind === it.kind && x.item.id === it.id));
+      const x1 = Math.min(...its.map((i) => i.bbox[0]));
+      const y1 = Math.min(...its.map((i) => i.bbox[1]));
+      const rect: Rect = its.length ? [x1, y1, Math.max(...its.map((i) => i.bbox[0] + i.bbox[2])) - x1, Math.max(...its.map((i) => i.bbox[1] + i.bbox[3])) - y1] : [0, 0, 0, 0];
+      e.woBar = { page: pg, req: null, rect, batch: edits, annots: res.annots };
+      return false;
+    }
     if (res.kind !== "ok") {
       e.objError = t("editCannotMove");
       return false;
     }
+    e.woBar = null;
     for (const m of res.pages) {
       e.models[m.page] = m;
       e.pgen[m.page] = (e.pgen[m.page] ?? 0) + 1;
@@ -686,9 +789,10 @@ export async function runBatch(edits: ObjEdit3[]): Promise<boolean> {
     e.busy = false;
   }
 }
+export const moveItemsOf = (page: number, items: ItemRef[], dx: number, dy: number) => runBatch(items.map((item) => ({ kind: "move", page, item, dx, dy })));
 export function moveItems(dx: number, dy: number) {
   const is = e.isel;
-  return is ? runBatch(is.items.map((item) => ({ kind: "move", page: is.page, item, dx, dy }))) : Promise.resolve(false);
+  return is ? moveItemsOf(is.page, is.items, dx, dy) : Promise.resolve(false);
 }
 export const resizeItem = (page: number, item: ItemRef, rect: Rect) => runBatch([{ kind: "resize", page, item, rect }]);
 
@@ -835,6 +939,7 @@ export function hfChanged(pos: HfPos) {
   hfT[pos] = setTimeout(() => void runHf(pos), 300);
 }
 async function runHf(pos: HfPos) {
+  hfT[pos] = undefined;
   if (busyNow()) return void (hfT[pos] = setTimeout(() => void runHf(pos), 100));
   const s = e.hf.spots[pos];
   const pages = pagesWire(s.allPages, s.ranges);

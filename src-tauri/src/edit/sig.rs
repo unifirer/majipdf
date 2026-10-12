@@ -130,15 +130,34 @@ pub fn crop_and_fit(img: &RgbaImage) -> Result<RgbaImage, String> {
     Ok(c)
 }
 
-fn load_source(path: &Path) -> Result<RgbaImage, String> {
+/// Decode limits for anything imported: dimensions and allocation are capped before a pixel is decoded.
+fn limited(mut r: image::ImageReader<impl std::io::BufRead + std::io::Seek>) -> Result<RgbaImage, String> {
+    let mut lim = image::Limits::default();
+    lim.max_image_width = Some(16_000);
+    lim.max_image_height = Some(16_000);
+    lim.max_alloc = Some(512 << 20);
+    r.limits(lim);
+    r.decode().map(|i| i.to_rgba8()).map_err(|e| format!("cannot read the image: {e}"))
+}
+
+/// The longest side a rendered PDF page may have, in pixels.
+const MAX_RENDER_PX: f64 = 4000.0;
+
+pub(super) fn load_source(path: &Path) -> Result<RgbaImage, String> {
     let is_pdf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
     if is_pdf {
         let p = pdf::pdfium()?;
         let d = p.load_pdf_from_file(path, None).map_err(|e| e.to_string())?;
         let pg = d.pages().get(0).map_err(|e| e.to_string())?;
-        return Ok(pg.render_with_config(&PdfRenderConfig::new().scale_page_by_factor(300.0 / 72.0)).map_err(|e| e.to_string())?.as_image().map_err(|e| e.to_string())?.to_rgba8());
+        let long = pg.width().value.max(pg.height().value) as f64;
+        if !long.is_finite() || long <= 0.0 {
+            return Err("bad page size".into());
+        }
+        // 300 DPI, but never more than MAX_RENDER_PX on the long side
+        let k = (300.0_f64 / 72.0).min(MAX_RENDER_PX / long);
+        return Ok(pg.render_with_config(&PdfRenderConfig::new().scale_page_by_factor(k as f32)).map_err(|e| e.to_string())?.as_image().map_err(|e| e.to_string())?.to_rgba8());
     }
-    Ok(image::open(path).map_err(|e| format!("cannot read the image: {e}"))?.to_rgba8())
+    limited(image::ImageReader::open(path).map_err(|e| format!("cannot read the image: {e}"))?.with_guessed_format().map_err(|e| e.to_string())?)
 }
 
 fn thumb(png: &[u8]) -> Result<(u32, u32, String), String> {
@@ -206,9 +225,13 @@ impl Lib {
         std::fs::write(self.dir.join(format!("{id}.png")), &bytes).map_err(|e| e.to_string())?;
         let kind = if kind == "stamp" { "stamp" } else { "signature" };
         let name = name.trim();
+        let base: String = if name.is_empty() { "Signature".into() } else { name.chars().take(56).collect() };
+        // The name is only a label in the library; number repeats ("Signature 2") so items stay tellable apart.
+        let taken = |n: &str| idx.iter().any(|e| e.name.eq_ignore_ascii_case(n));
+        let name = (1..).map(|i| if i == 1 { base.clone() } else { format!("{base} {i}") }).find(|n| !taken(n)).unwrap_or(base);
         let e = Entry {
             id,
-            name: if name.is_empty() { "Signature".into() } else { name.chars().take(60).collect() },
+            name,
             kind: kind.into(),
             added: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         };
@@ -227,9 +250,23 @@ impl Lib {
 
     pub fn add_drawn(&self, data_url: &str, name: &str) -> Result<SigItem, String> {
         let b64 = data_url.split_once(',').map(|x| x.1).unwrap_or(data_url);
+        if b64.len() > 30_000_000 {
+            return Err("image too large".into());
+        }
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|e| e.to_string())?;
-        let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?.to_rgba8();
+        let img = limited(image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().map_err(|e| e.to_string())?)?;
         self.add(&crop_and_fit(&img)?, name, "signature")
+    }
+
+    /// Deletes every item and the index: all files of the library folder.
+    pub fn clear(&self) -> Result<(), String> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Ok(()) };
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_file()) {
+                std::fs::remove_file(e.path()).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     pub fn rename(&self, id: &str, name: &str) -> Result<(), String> {
@@ -273,6 +310,11 @@ pub async fn sig_add_drawn(data_url: String, name: String) -> Result<SigItem, St
 #[tauri::command]
 pub fn sig_rename(id: String, name: String) -> Result<(), String> {
     lib()?.rename(&id, &name)
+}
+
+#[tauri::command]
+pub fn sig_clear() -> Result<(), String> {
+    lib()?.clear()
 }
 
 #[tauri::command]

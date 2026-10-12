@@ -164,6 +164,7 @@ pub fn run() {
             edit::sig::sig_add_drawn,
             edit::sig::sig_rename,
             edit::sig::sig_delete,
+            edit::sig::sig_clear,
             edit::edit_undo,
             edit::edit_redo,
             edit::edit_history,

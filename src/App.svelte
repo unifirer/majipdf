@@ -18,6 +18,8 @@
   import OcrTool from "./lib/components/OcrTool.svelte";
   import EditTool from "./lib/components/EditTool.svelte";
   import ExcelTool from "./lib/components/ExcelTool.svelte";
+  import SigManager from "./lib/components/SigManager.svelte";
+  import SigDraw from "./lib/components/SigDraw.svelte";
   import ToolFrame from "./lib/components/ToolFrame.svelte";
   import OfficeMissing from "./lib/components/OfficeMissing.svelte";
 
@@ -107,6 +109,14 @@
 
   {#if app.settingsOpen}
     <SettingsPopover />
+  {/if}
+
+  {#if app.sigManageOpen}
+    <SigManager />
+  {/if}
+
+  {#if app.edit.drawOpen}
+    <SigDraw />
   {/if}
 
   {#if app.aboutOpen}
